@@ -64,10 +64,10 @@ The SGX driver maintains a hierarchy of objects:
 1. A list of TGID contexts pointed to by `sgx_tgid_ctx_list` and with items of type `sgx_tgid_ctx`
 2. For each TGID context, a list of its enclaves pointed to by `sgx_tgid_ctx.encl_list` and with items of type `sgx_encl`
 3. For each enclave, several containers of enclave pages:
-  - a list of VA pages pointed to by `sgx_encl.va_pages` and with items of type `sgx_va_page`
-  - exactly one SECS page pointed to by `sgx_encl.secs_page` and of type `sgx_encl_page`
-  - a radix tree of REG/TCS pages pointed to by `sgx_encl.page_tree` and with items of type `sgx_encl_page`
-  - a list of currently present (loaded in EPC) pages pointed to by `sgx_encl.load_list`
+    - a list of VA pages pointed to by `sgx_encl.va_pages` and with items of type `sgx_va_page`
+    - exactly one SECS page pointed to by `sgx_encl.secs_page` and of type `sgx_encl_page`
+    - a radix tree of REG/TCS pages pointed to by `sgx_encl.page_tree` and with items of type `sgx_encl_page`
+    - a list of currently present (loaded in EPC) pages pointed to by `sgx_encl.load_list`
 
 Note that `sgx_encl.page_tree` contains *all* enclave pages including the swapped-out ones, while `sgx_encl.load_list` contains only those pages which are currently present in EPC.
 

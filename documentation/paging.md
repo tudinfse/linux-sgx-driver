@@ -47,10 +47,10 @@ To clean-up and remove the shared-memory regions, the driver uses `fput()`: `fpu
 For page eviction, `EWB` requires three inputs:
 1. EPC page virtual address -- enclave page to be evicted
 2. Pointer to PAGEINFO struct (four 8B fields, 32B total) with the following fields:
-  - `srcpge` containing the physical address of a backing regular-memory page -> encrypted EPC page will be evicted here
-  - `linaddr` set to zero; note that EPC page address was given in (1), so this field can be zero
-  - `secs` set to zero
-  - `pcmd` containing physical address of a corresponding regular-memory page storing PCMD metadata for this EPC page
+    - `srcpge` containing the physical address of a backing regular-memory page -> encrypted EPC page will be evicted here
+    - `linaddr` set to zero; note that EPC page address was given in (1), so this field can be zero
+    - `secs` set to zero
+    - `pcmd` containing physical address of a corresponding regular-memory page storing PCMD metadata for this EPC page
 
 ## Background kernel thread ksgxswapd
 

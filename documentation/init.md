@@ -65,11 +65,11 @@ platform and use this information to restore the enclave to its original state a
 
 According to this, the driver registers power-management (`driver.pm`) callbacks:
 1. `sgx_pm_suspend` for suspend/hibernate, for *all current enclaves*:
-  - invalidates enclave by removing PTEs for TCS pages
-  - marks enclave as dead and suspended thus disallowing any SGX-related actions
-  - stops the background `ksgxswapd` thread
+    - invalidates enclave by removing PTEs for TCS pages
+    - marks enclave as dead and suspended thus disallowing any SGX-related actions
+    - stops the background `ksgxswapd` thread
 2. `sgx_pm_resume` for resume:
-  - restarts the background `ksgxswapd` thread
+    - restarts the background `ksgxswapd` thread
 
 The driver doesn't perform any enclave cleanup (`sgx_encl_release()`).
 It is the responsibility of the host application to notice the invalidated enclave, destroy it and create a new one.
@@ -83,6 +83,6 @@ Note that invalidated enclaves still consume memory: their EPC pages are not rem
 * `sgx_drv_probe()` and `sgx_init_platform()` both perform the same CPUID validation steps. One of these functions thus seems redundant.
 
 * There is probably a bug in `sgx_dev_init()`:
-  - `sgx_page_cache_init()` is called as many times as there are EPC banks
-  - but `sgx_page_cache_init()` creates a background thread `ksgxswapd_tsk = kthread_run(ksgxswapd, NULL, "ksgxswapd")` each time it is called
-  - thus, there will be several background threads created if there are several EPC banks; only the last one will be known to the driver via global variable `ksgxswapd_tsk`
+    - `sgx_page_cache_init()` is called as many times as there are EPC banks
+    - but `sgx_page_cache_init()` creates a background thread `ksgxswapd_tsk = kthread_run(ksgxswapd, NULL, "ksgxswapd")` each time it is called
+    - thus, there will be several background threads created if there are several EPC banks; only the last one will be known to the driver via global variable `ksgxswapd_tsk`

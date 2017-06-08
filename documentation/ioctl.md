@@ -12,8 +12,8 @@ The host app communicates its "enclave intentions" to the driver using `ioctl()`
 There are only three commands:
 1. *Enclave creation*: host app requests to create new enclave using `ECREATE`
 2. *Enclave page addition*: host app requests to add & measure a new page to the created enclave, proceeding in two steps:
-  - first the new page is added using `EADD`
-  - then a subset of the 16 256B-chunks (specified in `sgx_enclave_add_page.mrmask`) is measured using `EEXTEND`
+    - first the new page is added using `EADD`
+    - then a subset of the 16 256B-chunks (specified in `sgx_enclave_add_page.mrmask`) is measured using `EEXTEND`
 3. *Enclave initialization*: host app requests to initialize new enclave using `EINIT`
 
 Note that all other enclave operations are performed in user space (`EENTER`, `ERESUME`, `EEXIT`, `EGETKEY`, `EREPORT`) or using paging/swapping mechanisms (`EBLOCK`, `ETRACK`, `ELDU`, `EWB`).
@@ -42,8 +42,8 @@ The function creates the enclave as follows:
 4. Finds a free EPC page to serve as SECS page
 5. Creates the enclave's SECS page, assigns it a VA slot, sets its address to be right-after ELRANGE, and associates with address of EPC page from (4)
 6. Calls `ECREATE` with the created SECS page as input
-  - on success, associates user-mmaped VMA with the enclave
-  - on failure, releases the enclave object
+    - on success, associates user-mmaped VMA with the enclave
+    - on failure, releases the enclave object
 7. Releases memory of the unneeded SECS structure, allocated at (1)
 
 ### sgx_ioc_enclave_add_page
@@ -53,12 +53,12 @@ The function add a single user-supplied page to the enclave as follows:
 1. Copies the user-supplied SECINFO structure and page into kernel space
 2. Validates these structures (SECINFO, TCS page if needed)
 3. Prepares objects for the worker thread `sgx_add_page_worker` to pick up and perform actual `EADD+EEXTEND`; the objects are:
-  - a temporary copy of the user-supplied page in the `backing` page
-  - an `sgx_add_page_req` request with page-info; this request is added to the enclave's worker list `add_page_requests`
+    - a temporary copy of the user-supplied page in the `backing` page
+    - an `sgx_add_page_req` request with page-info; this request is added to the enclave's worker list `add_page_requests`
 4. The worker thread is awaken and picks up the list of add-page requests:
-  - Grabs a free physical EPC page and associates it with a virtual enclave page in enclave VMA
-  - Adds the page with `EADD`
-  - Measures user-specified chunks of the page with `EEXTEND`
+    - Grabs a free physical EPC page and associates it with a virtual enclave page in enclave VMA
+    - Adds the page with `EADD`
+    - Measures user-specified chunks of the page with `EEXTEND`
 
 ### sgx_ioc_enclave_init
 
@@ -67,8 +67,8 @@ The function initializes the enclave as follows:
 1. Copies the user-supplied SIGSTRUCT and EINITTOKEN structures into kernel space
 2. Flushes pending enclave pages `EADD`ed by the worker thread in background (see above)
 3. Calls `EINIT`, retries several times on failure:
-  - `EINIT` might fail because of an interrupt storm
-  - so first try to spin several times, then try to sleep a bit several times
+    - `EINIT` might fail because of an interrupt storm
+    - so first try to spin several times, then try to sleep a bit several times
 4. On success, marks the enclave as initialized
 
 Note that after this step, SGX 1.0 disallows adding/measuring new pages.
