@@ -63,14 +63,19 @@
 #include <linux/types.h>
 #include <linux/ioctl.h>
 
+/* IOCTL identifying number, unused as per ioctl/ioctl-number.txt */
 #define SGX_MAGIC 0xA4
 
+/**
+ * Three IOCTL commands from userland to driver to create&init enclave,
+ * all provide one struct argument and read no data from driver
+ */
 #define SGX_IOC_ENCLAVE_CREATE \
-	_IOW(SGX_MAGIC, 0x00, struct sgx_enclave_create)
+	_IOW(SGX_MAGIC, 0x00, struct sgx_enclave_create)	/* sgx_ioc_enclave_create() */
 #define SGX_IOC_ENCLAVE_ADD_PAGE \
-	_IOW(SGX_MAGIC, 0x01, struct sgx_enclave_add_page)
+	_IOW(SGX_MAGIC, 0x01, struct sgx_enclave_add_page)  /* sgx_ioc_enclave_add_page() */
 #define SGX_IOC_ENCLAVE_INIT \
-	_IOW(SGX_MAGIC, 0x02, struct sgx_enclave_init)
+	_IOW(SGX_MAGIC, 0x02, struct sgx_enclave_init)	    /* sgx_ioc_enclave_init() */
 
 /* SGX leaf instruction return values */
 #define SGX_SUCCESS			0
@@ -128,9 +133,9 @@ struct sgx_enclave_add_page {
 /**
  * struct sgx_enclave_init - parameter structure for the
  *                           %SGX_IOC_ENCLAVE_INIT ioctl
- * @addr:	address in the ELRANGE
- * @sigstruct:	address for the page data
- * @einittoken:	address for the SECINFO data
+ * @addr:		address for the SECS page data
+ * @sigstruct:	address for the SIGSTRUCT structure
+ * @einittoken:	address for the EINITTOKEN structure (created by Launch Enclave)
  */
 struct sgx_enclave_init {
 	__u64	addr;
@@ -138,6 +143,7 @@ struct sgx_enclave_init {
 	__u64	einittoken;
 } __packed;
 
+/* UNUSED */
 struct sgx_enclave_destroy {
 	__u64	addr;
 } __packed;

@@ -67,6 +67,12 @@
 
 #define SGX_CPUID		0x12
 
+/**
+ * SECS: single page per enclave, contains ELRANGE, enclave flags, etc.
+ * TCS:  single page per thread, contains SSA info, FS/GS addresses, etc.
+ * REG:  regular page
+ * VA:   Version Array page, each contains 512 nonce slots, each associated with REG page
+ */
 enum sgx_page_type {
 	SGX_PAGE_TYPE_SECS	= 0x00,
 	SGX_PAGE_TYPE_TCS	= 0x01,
@@ -74,6 +80,16 @@ enum sgx_page_type {
 	SGX_PAGE_TYPE_VA	= 0x03,
 };
 
+/**
+ * SGX_SECINFO_R:     page can be read from inside the enclave
+ * SGX_SECINFO_W:     page can be written from inside the enclave
+ * SGX_SECINFO_X:     page can be executed from inside the enclave
+ * SGX_SECINFO_SECS:  page is SECS (SGX Enclave Control Structure)
+ * SGX_SECINFO_TCS:   page is TCS (Thread Control Structure)
+ * SGX_SECINFO_REG:   page is REG (regular page)
+ *
+ * NOTE: PENDING and MODIFIED flags as well as VA&TRIM page types are missing
+ */
 enum sgx_secinfo_flags {
 	SGX_SECINFO_R		= 0x01,
 	SGX_SECINFO_W		= 0x02,
@@ -83,11 +99,22 @@ enum sgx_secinfo_flags {
 	SGX_SECINFO_REG		= 0x200ULL,
 };
 
+/**
+ * struct sgx_secinfo - metadata for each enclave page
+ *
+ * @flags:     RWX/page type flags (sgx_secinfo_flags)
+ */
 struct sgx_secinfo {
 	u64	flags;
 	u64	reserved[7];
 } __aligned(128);
 
+/**
+ * struct sgx_einittoken - token to verify that enclave is permitted to launch
+ *                         (created by Launch Enclave)
+ * @valid:     bit 1: 1 - valid, 0 - debug
+ * @isvsvnle:  Launch Enclave’s ISVSVN (Security Version Number)
+ */
 struct sgx_einittoken {
 	u32	valid;
 	u8	reserved1[206];
@@ -95,6 +122,12 @@ struct sgx_einittoken {
 	u8	reserved2[92];
 } __aligned(512);
 
+/**
+ * SGX_SECS_A_DEBUG:          permit debugger to read&write data to enclave
+ * SGX_SECS_A_MODE64BIT:      enclave runs in 64-bit mode
+ * SGX_SECS_A_PROVISION_KEY:  Provisioning Key is available from EGETKEY
+ * SGX_SECS_A_LICENSE_KEY:    EINIT token key is available from EGETKEY
+ */
 enum isgx_secs_attributes {
 	SGX_SECS_A_DEBUG		= BIT_ULL(1),
 	SGX_SECS_A_MODE64BIT		= BIT_ULL(2),
@@ -110,6 +143,19 @@ enum isgx_secs_attributes {
 #define SGX_SECS_RESERVED3_SIZE 96
 #define SGX_SECS_RESERVED4_SIZE 3836
 
+/**
+ * struct sgx_secs - SGX Enclave Control Structure, one per enclave
+ *
+ * @size:          size of enclave in bytes; must be power of 2
+ * @base:          Enclave Base Linear Address; must be aligned to size
+ * @ssaframesize:  size of one SSA frame in pages (including GPR, XSAVE, etc)
+ * @flags:         enclave flags (isgx_secs_attributes)
+ * @xfrm:          XSAVE Feature Request Mask (SSE, AVX, MPX, etc)
+ * @mrenclave:     Measurement Register (MR) of enclave build process
+ * @mrsigner:      MR extended with public key that verified enclave
+ * @isvvprodid:    product ID of enclave
+ * @isvsvn:        Security Version Number of enclave
+ */
 struct sgx_secs {
 	u64	size;
 	u64	base;
@@ -126,6 +172,21 @@ struct sgx_secs {
 	uint8_t	reserved[SGX_SECS_RESERVED4_SIZE];
 };
 
+/**
+ * struct sgx_tcs - Thread Control Structure, one per thread
+ *
+ * @state:    RESERVED, UNDOCUMENTED
+ * @flags:    thread's flags (currently only debug mode)
+ * @ossa:     offset of base of SSA stack, relative to enclave base
+ * @cssa:     current slot index of SSA frame
+ * @nssa:     # available slots for SSA frames
+ * @oentry:   offset in enclave to which control is transferred on EENTER
+ * @aep:      RESERVED, UNDOCUMENTED
+ * @ofsbase:  base address FS segment, relative to enclave base
+ * @ogsbase:  base address GS segment, relative to enclave base
+ * @fslimit:  FS limit, only in 32-bit mode
+ * @gslimit:  GS limit, only in 32-bit mode
+ */
 struct sgx_tcs {
 	u64 state;
 	u64 flags;
@@ -141,6 +202,11 @@ struct sgx_tcs {
 	u64 reserved[503];
 };
 
+/**
+ * SGX_SECINFO_PERMISSION_MASK:  mask for RWX flags
+ * SGX_SECINFO_PAGE_TYPE_MASK:   mask for page type
+ * SGX_SECINFO_RESERVED_MASK:    mask for reserved bits
+ */
 enum sgx_secinfo_masks {
 	SGX_SECINFO_PERMISSION_MASK	= GENMASK_ULL(2, 0),
 	SGX_SECINFO_PAGE_TYPE_MASK	= GENMASK_ULL(15, 8),
@@ -148,6 +214,13 @@ enum sgx_secinfo_masks {
 					   GENMASK_ULL(63, 16)),
 };
 
+/**
+ * struct sgx_pcmd - Paging Crypto MetaData, 128B for each swapped-out page
+ *
+ * @secinfo:     metadata for page (RWX flags, etc)
+ * @enclave_id:  enclave ID
+ * @mac:         MAC for page contents, page metadata, VA nonce, reserved field
+ */
 struct sgx_pcmd {
 	struct sgx_secinfo secinfo;
 	u64 enclave_id;
@@ -155,6 +228,14 @@ struct sgx_pcmd {
 	u8 mac[16];
 };
 
+/**
+ * struct sgx_page_info - used as parameter to EPC-management instructions
+ *
+ * @linaddr:       address in the ELRANGE
+ * @srcpge:        address in normal RAM (EADD: copy-from, EWB: swap-to)
+ * @secinfo/pcmd:  address of the SECINFO (ECREATE/EADD) or PCMD (for ELD/EWB)
+ * @secs:          address of SECS page
+ */
 struct sgx_page_info {
 	u64 linaddr;
 	u64 srcpge;
@@ -165,9 +246,12 @@ struct sgx_page_info {
 	u64 secs;
 } __aligned(32);
 
+/* Driver does not need SIGSTRUCT structure, only its size to copy-from-user */
 #define SIGSTRUCT_SIZE 1808
+/* NOTE: this macro can be replaced with sizeof(struct sgx_einittoken) */
 #define EINITTOKEN_SIZE 304
 
+/*  EAX/RAX register value for ENCLS/ENCLU instructions */
 enum {
 	ECREATE	= 0x0,
 	EADD	= 0x1,
@@ -186,6 +270,7 @@ enum {
 	EMODT	= 0xF,
 };
 
+/* for SGX instructions that return info/error code in RAX */
 #define __encls_ret(rax, rbx, rcx, rdx)			\
 	({						\
 	int ret;					\
@@ -202,6 +287,7 @@ enum {
 	ret;						\
 	})
 
+/* for SGX instructions that return nothing: RAX=0 on success and -1 on fault */
 #ifdef CONFIG_X86_64
 #define __encls(rax, rbx, rcx, rdx...)			\
 	({						\
@@ -341,6 +427,12 @@ static inline int __emodt(struct sgx_secinfo *secinfo, void *epc)
 
 struct sgx_encl;
 
+/**
+ * struct sgx_epc_page - Metadata for EPC page
+ *
+ * @pa:         physical address in one of the EPC banks
+ * @free_list:  item in list of free EPC pages (head is sgx_free_list)
+ */
 struct sgx_epc_page {
 	resource_size_t	pa;
 	struct list_head free_list;

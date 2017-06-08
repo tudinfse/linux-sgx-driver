@@ -78,6 +78,7 @@ static DEFINE_SPINLOCK(sgx_free_list_lock);
 
 LIST_HEAD(sgx_tgid_ctx_list);
 DEFINE_MUTEX(sgx_tgid_ctx_mutex);
+
 static unsigned int sgx_nr_total_epc_pages;
 static unsigned int sgx_nr_free_pages;
 static unsigned int sgx_nr_low_pages = SGX_NR_LOW_EPC_PAGES_DEFAULT;
@@ -121,6 +122,14 @@ int sgx_test_and_clear_young(struct sgx_encl_page *page, struct sgx_encl *encl)
 				   sgx_test_and_clear_young_cb, vma->vm_mm);
 }
 
+/**
+ * sgx_isolate_tgid_ctx() - Find first TGID with at least one enclave
+ * @nr_to_scan:	# TGIDs to scan (currently always SGX_NR_SWAP_CLUSTER_MAX)
+ *
+ * Iterates through @nr_to_scan TGIDs (i.e., host apps) and finds non-empty
+ * TGID context. Found TGID is also moved to tail of list to follow LRU policy.
+ * Also, kref_get() it since this TGID context is referenced now.
+ */
 static struct sgx_tgid_ctx *sgx_isolate_tgid_ctx(unsigned long nr_to_scan)
 {
 	struct sgx_tgid_ctx *ctx = NULL;
@@ -157,6 +166,15 @@ static struct sgx_tgid_ctx *sgx_isolate_tgid_ctx(unsigned long nr_to_scan)
 	return ctx;
 }
 
+/**
+ * sgx_isolate_encl() - Find first enclave with at least one loaded page
+ * @ctx:		TGID context where to search for enclaves
+ * @nr_to_scan:	# enclaves to scan (currently always SGX_NR_SWAP_CLUSTER_MAX)
+ *
+ * Iterates through @nr_to_scan enclaves in @ctx and finds enclave with at
+ * least one loaded page. Found enclave is also moved to tail of list to follow
+ * LRU policy. Also, kref_get() it since this enclave is referenced now.
+ */
 static struct sgx_encl *sgx_isolate_encl(struct sgx_tgid_ctx *ctx,
 					       unsigned long nr_to_scan)
 {
@@ -193,6 +211,16 @@ static struct sgx_encl *sgx_isolate_encl(struct sgx_tgid_ctx *ctx,
 	return encl;
 }
 
+/**
+ * sgx_isolate_pages() - move LRU enclave pages into destination list
+ * @encl:		enclave from which to evict pages
+ * @dst:		destination list of pages-to-evict
+ * @nr_to_scan:	# pages to scan (currently always SGX_NR_SWAP_CLUSTER_MAX)
+ *
+ * Iterates through @nr_to_scan pages in @encl and adds pages-to-evict
+ * (pages which were not recently accessed or already reserved) to @dst.
+ * Scanned pages are moved to tail of load_list to follow LRU policy.
+ */
 static void sgx_isolate_pages(struct sgx_encl *encl,
 			      struct list_head *dst,
 			      unsigned long nr_to_scan)
@@ -213,11 +241,15 @@ static void sgx_isolate_pages(struct sgx_encl *encl,
 					 struct sgx_encl_page,
 					 load_list);
 
+		/* if page was not recently accessed and not yet reserved (note that
+		   page is reserved either during eviction or on debug accesses) */
 		if (!sgx_test_and_clear_young(entry, encl) &&
 		    !(entry->flags & SGX_ENCL_PAGE_RESERVED)) {
+			/* then add it to list of pages-to-evict */
 			entry->flags |= SGX_ENCL_PAGE_RESERVED;
 			list_move_tail(&entry->load_list, dst);
 		} else {
+			/* else follow LRU policy (entry's access bit is cleared now) */
 			list_move_tail(&entry->load_list, &encl->load_list);
 		}
 	}
@@ -225,6 +257,7 @@ out:
 	mutex_unlock(&encl->lock);
 }
 
+/* mark EPC page as blocked (EBLOCK) */
 static void sgx_eblock(struct sgx_encl *encl,
 		       struct sgx_epc_page *epc_page)
 {
@@ -232,6 +265,10 @@ static void sgx_eblock(struct sgx_encl *encl,
 	int ret;
 
 	vaddr = sgx_get_page(epc_page);
+	/**
+	 * ENCLS(EBLOCK) instruction with:
+	 *   vaddr  - device address of EPC page
+	 */
 	ret = __eblock((unsigned long)vaddr);
 	sgx_put_page(vaddr);
 
@@ -242,12 +279,17 @@ static void sgx_eblock(struct sgx_encl *encl,
 
 }
 
+/* instruct SGX to keep track of encl exits on all CPUs (ETRACK) */
 static void sgx_etrack(struct sgx_encl *encl)
 {
 	void *epc;
 	int ret;
 
 	epc = sgx_get_page(encl->secs_page.epc_page);
+	/**
+	 * ENCLS(ETRACK) instruction with:
+	 *   epc  - device address of enclave's SECS page
+	 */
 	ret = __etrack(epc);
 	sgx_put_page(epc);
 
@@ -257,6 +299,14 @@ static void sgx_etrack(struct sgx_encl *encl)
 	}
 }
 
+/**
+ * __sgx_ewb() - evict one enclave page's contents and PCMD to backing RAM
+ * @encl:		corresponding enclave
+ * @encl_page:	enclave page to evict
+ *
+ * Finds backing and PCMD regular RAM pages to store enclave page's contents
+ * and PCMD respectively. Executes ENCLS(EWB) to evict @encl_page.
+ */
 static int __sgx_ewb(struct sgx_encl *encl,
 		     struct sgx_encl_page *encl_page)
 {
@@ -268,8 +318,10 @@ static int __sgx_ewb(struct sgx_encl *encl,
 	void *va;
 	int ret;
 
+	/* find PCMD address offset corresponding to enclave page */
 	pcmd_offset = ((encl_page->addr >> PAGE_SHIFT) & 31) * 128;
 
+	/* find backing RAM page to store encrypted enclave page's contents */
 	backing = sgx_get_backing(encl, encl_page, false);
 	if (IS_ERR(backing)) {
 		ret = PTR_ERR(backing);
@@ -278,7 +330,8 @@ static int __sgx_ewb(struct sgx_encl *encl,
 		return ret;
 	}
 
-	pcmd = sgx_get_backing(encl, encl_page, true);
+	/* find PCMD RAM page to store enclave page's metadata */
+	pcmd = sgx_get_backing(encl, encl_page, true /* pcmd */);
 	if (IS_ERR(pcmd)) {
 		ret = PTR_ERR(pcmd);
 		sgx_warn(encl, "pinning the pcmd page for EWB failed with %d\n",
@@ -293,6 +346,15 @@ static int __sgx_ewb(struct sgx_encl *encl,
 	pginfo.pcmd = (unsigned long)kmap_atomic(pcmd) + pcmd_offset;
 	pginfo.linaddr = 0;
 	pginfo.secs = 0;
+
+	/**
+	 * ENCLS(EWB) instruction with:
+	 *   pginfo.srcpge  - kernel address of backing EPC content page (dst)
+	 *   pginfo.pcmd    - kernel address of backing page with PCMD entry (dst)
+	 *   pginfo.<other> - unused, set to zero
+	 *   epc_ptr        - device address of source EPC page
+	 *   va_ptr         - device address of corresponding VA page
+	 */
 	ret = __ewb(&pginfo, epc,
 		    (void *)((unsigned long)va + encl_page->va_offset));
 	kunmap_atomic((void *)(unsigned long)(pginfo.pcmd - pcmd_offset));
@@ -300,13 +362,23 @@ static int __sgx_ewb(struct sgx_encl *encl,
 
 	sgx_put_page(va);
 	sgx_put_page(epc);
-	sgx_put_backing(pcmd, true);
+	sgx_put_backing(pcmd, true /* write */);
 
 out:
-	sgx_put_backing(backing, true);
+	sgx_put_backing(backing, true /* write */);
 	return ret;
 }
 
+/**
+ * sgx_ewb() - evict one enclave page by calling __sgx_ewb()
+ * @encl:		corresponding enclave
+ * @encl_page:	enclave page to evict
+ *
+ * Calls __sgx_ewb() to execute EWB. Assuming ETRACK was issued, first tries
+ * fast path (without flushing CPUs) in the hope that corresponding TLBs were
+ * flushed already. If it fails, takes slow path and flushes CPUs explicitly.
+ * If even this doesn't work, panics and invalidates enclave.
+ */
 static bool sgx_ewb(struct sgx_encl *encl,
 		    struct sgx_encl_page *entry)
 {
@@ -329,6 +401,7 @@ static bool sgx_ewb(struct sgx_encl *encl,
 	return true;
 }
 
+/* evict enclave page via EWB, remove from page cache, EREMOVE its EPC page */
 static void sgx_evict_page(struct sgx_encl_page *entry,
 			   struct sgx_encl *encl)
 {
@@ -338,6 +411,18 @@ static void sgx_evict_page(struct sgx_encl_page *entry,
 	entry->flags &= ~SGX_ENCL_PAGE_RESERVED;
 }
 
+/**
+ * sgx_write_pages() - evict batch of EPC pages in list @src from enclave
+ * @encl:	corresponding enclave
+ * @src:	source list of pages-to-evict
+ *
+ * Performs complete page eviction cycle for each EPC page in @src list:
+ * first EBLOCKs pages, also removing their PTEs, then issues enclave's ETRACK,
+ * finally evicts each page via EWB and removes from enclave's load_list.
+ * If all pages of enclave were evicted, evict its SECS page.
+ *
+ * NOTE: In current scheme, VA pages are *never* evicted and can clog EPC!
+ */
 static void sgx_write_pages(struct sgx_encl *encl, struct list_head *src)
 {
 	struct sgx_encl_page *entry;
@@ -347,6 +432,7 @@ static void sgx_write_pages(struct sgx_encl *encl, struct list_head *src)
 	if (list_empty(src))
 		return;
 
+	/* dead code ??? */
 	entry = list_first_entry(src, struct sgx_encl_page, load_list);
 
 	mutex_lock(&encl->lock);
@@ -355,6 +441,7 @@ static void sgx_write_pages(struct sgx_encl *encl, struct list_head *src)
 	list_for_each_entry_safe(entry, tmp, src, load_list) {
 		vma = sgx_find_vma(encl, entry->addr);
 		if (vma) {
+			/* remove PTEs for each page-to-evict in enclave's VMA */
 			zap_vma_ptes(vma, entry->addr, PAGE_SIZE);
 		}
 
@@ -381,6 +468,13 @@ static void sgx_write_pages(struct sgx_encl *encl, struct list_head *src)
 	mutex_unlock(&encl->lock);
 }
 
+/**
+ * sgx_swap_pages() - evict @nr_to_scan enclave pages from some LRU enclave
+ * @nr_to_scan:	# pages to scan (currently always SGX_NR_SWAP_CLUSTER_MAX)
+ *
+ * From all enclaves in all TGID contexts (host apps), finds one LRU enclave
+ * in one LRU context and evicts @nr_to_scan pages from it into backing RAM.
+ */
 static void sgx_swap_pages(unsigned long nr_to_scan)
 {
 	struct sgx_tgid_ctx *ctx;
@@ -395,16 +489,26 @@ static void sgx_swap_pages(unsigned long nr_to_scan)
 	if (!encl)
 		goto out;
 
+	/* perform page evictions under enclave mm lock */
 	down_read(&encl->mm->mmap_sem);
 	sgx_isolate_pages(encl, &cluster, nr_to_scan);
 	sgx_write_pages(encl, &cluster);
 	up_read(&encl->mm->mmap_sem);
 
+	/* enclave and context were kref_get'd, so need to kref_put */
 	kref_put(&encl->refcount, sgx_encl_release);
 out:
 	kref_put(&ctx->refcount, sgx_tgid_ctx_release);
 }
 
+/**
+ * ksgxswapd() - background thread to periodically swap enclave pages
+ * @p:	unused
+ *
+ * Background thread waits till it is woken up (by sgx_alloc_page()).
+ * Upon waking up, it checks if # free pages is less than threshold
+ * and performs page evictions.
+ */
 int ksgxswapd(void *p)
 {
 	while (!kthread_should_stop()) {
@@ -420,12 +524,22 @@ int ksgxswapd(void *p)
 	return 0;
 }
 
+/**
+ * sgx_page_cache_init() - add free pages backed up by PRM memory to page cache
+ * @start:	device base address of PRM memory section
+ * @size:	size of PRM memory section (in bytes)
+ *
+ * Creates @size/PAGE_SIZE EPC pages backed up by this PRM memory section
+ * and adds them to the list of free pages. Additionally sets the threshold
+ * when to wake up ksgxswapd background thread and starts this thread.
+ */
 int sgx_page_cache_init(resource_size_t start, unsigned long size)
 {
 	unsigned long i;
 	struct sgx_epc_page *new_epc_page, *entry;
 	struct list_head *parser, *temp;
 
+	/* add EPC pages backed up by PRM memory section to list of free pages */
 	for (i = 0; i < size; i += PAGE_SIZE) {
 		new_epc_page = kzalloc(sizeof(*new_epc_page), GFP_KERNEL);
 		if (!new_epc_page)
@@ -439,6 +553,7 @@ int sgx_page_cache_init(resource_size_t start, unsigned long size)
 		spin_unlock(&sgx_free_list_lock);
 	}
 
+	/* set threshold to wake up ksgxswapd and start this thread */
 	sgx_nr_high_pages = 2 * sgx_nr_low_pages;
 	ksgxswapd_tsk = kthread_run(ksgxswapd, NULL, "ksgxswapd");
 
@@ -454,6 +569,7 @@ err_freelist:
 	return -ENOMEM;
 }
 
+/* stop ksgxswapd thread and remove all EPC pages from free list */
 void sgx_page_cache_teardown(void)
 {
 	struct sgx_epc_page *entry;
@@ -471,6 +587,7 @@ void sgx_page_cache_teardown(void)
 	spin_unlock(&sgx_free_list_lock);
 }
 
+/* grab first page from the list of free pages (if any) and return it */
 static struct sgx_epc_page *sgx_alloc_page_fast(void)
 {
 	struct sgx_epc_page *entry = NULL;
@@ -554,6 +671,10 @@ int sgx_free_page(struct sgx_epc_page *entry, struct sgx_encl *encl)
 	int ret;
 
 	epc = sgx_get_page(entry);
+	/**
+	 * ENCLS(EREMOVE) instruction with:
+	 *   epc  - device address of EPC page
+	 */
 	ret = __eremove(epc);
 	sgx_put_page(epc);
 
@@ -573,6 +694,7 @@ int sgx_free_page(struct sgx_epc_page *entry, struct sgx_encl *encl)
 }
 EXPORT_SYMBOL(sgx_free_page);
 
+/* return logical kernel address of EPC page; see sgx_dev_init() for x86-64 */
 void *sgx_get_page(struct sgx_epc_page *entry)
 {
 #ifdef CONFIG_X86_32
@@ -593,6 +715,7 @@ void *sgx_get_page(struct sgx_epc_page *entry)
 }
 EXPORT_SYMBOL(sgx_get_page);
 
+/* forget logical kernel address of EPC page; nop on x86-64 */
 void sgx_put_page(void *epc_page_vaddr)
 {
 #ifdef CONFIG_X86_32

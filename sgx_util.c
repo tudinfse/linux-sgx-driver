@@ -68,6 +68,17 @@
 #endif
 #include "linux/file.h"
 
+/**
+ * sgx_get_backing - return backing page with EPC content/PCMD for enclave page
+ *
+ * @encl:   corresponding enclave
+ * @entry:  enclave page for which to find backing EPC content/PCMD
+ * @pcmd:   false - find physical page with EPC content, 1 - with PCMD metadata
+ * @return physical page in backing RAM
+ *
+ * Finds enclave page's content/PCMD in backing RAM for entry whenever enclave
+ * needs to add, evict, or load-back enclave page
+ */
 struct page *sgx_get_backing(struct sgx_encl *encl,
 			     struct sgx_encl_page *entry,
 			     bool pcmd)
@@ -77,6 +88,7 @@ struct page *sgx_get_backing(struct sgx_encl *encl,
 	gfp_t gfpmask;
 	pgoff_t index;
 
+	/* use pcmd shmem to find PCMD page and backing shmem to find EPC page */
 	if (pcmd)
 		inode = encl->pcmd->f_path.dentry->d_inode;
 	else
@@ -85,14 +97,17 @@ struct page *sgx_get_backing(struct sgx_encl *encl,
 	mapping = inode->i_mapping;
 	gfpmask = mapping_gfp_mask(mapping);
 
+	/* for pcmd, /32 since one 4KB page corresponds to one 128B PCMD entry */
 	if (pcmd)
 		index = (entry->addr - encl->base) >> (PAGE_SHIFT + 5);
 	else
 		index = (entry->addr - encl->base) >> PAGE_SHIFT;
 
+	/* backing page; if page swapped to hard disk, first load-back to RAM */
 	return shmem_read_mapping_page_gfp(mapping, index, gfpmask);
 }
 
+/* release backing page, mark as dirty if it was updated/written to */
 void sgx_put_backing(struct page *backing_page, bool write)
 {
 	if (write)
@@ -101,6 +116,7 @@ void sgx_put_backing(struct page *backing_page, bool write)
 	put_page(backing_page);
 }
 
+/* find VMA for provided address, check it is associated with enclave encl */
 struct vm_area_struct *sgx_find_vma(struct sgx_encl *encl, unsigned long addr)
 {
 	struct vm_area_struct *vma;
@@ -113,6 +129,7 @@ struct vm_area_struct *sgx_find_vma(struct sgx_encl *encl, unsigned long addr)
 	return NULL;
 }
 
+/* remove PTEs for all TCS pages of enclave in particular VMA */
 void sgx_zap_tcs_ptes(struct sgx_encl *encl, struct vm_area_struct *vma)
 {
 	struct sgx_encl_page *entry;
@@ -125,30 +142,44 @@ void sgx_zap_tcs_ptes(struct sgx_encl *encl, struct vm_area_struct *vma)
 	}
 }
 
+/* remove PTEs for all TCS pages in all VMAs of enclave, mark enclave as dead;
+ * called whenever suspend/hibernate or unrecoverable error happens */
 void sgx_invalidate(struct sgx_encl *encl, bool flush_cpus)
 {
 	struct vm_area_struct *vma;
 	unsigned long addr;
 
+	/* iterate through all consecutive VMAs corresponding to enclave */
 	for (addr = encl->base; addr < (encl->base + encl->size);
 	     addr = vma->vm_end) {
 		vma = sgx_find_vma(encl, addr);
 		if (vma)
-			sgx_zap_tcs_ptes(encl, vma);
+			sgx_zap_tcs_ptes(encl, vma);  /* remove PTEs for TCSs */
 		else
 			break;
 	}
 
+	/* enclave is dead; it is responsibility of host app to re-create it */
 	encl->flags |= SGX_ENCL_DEAD;
 
+	/* only case we do not flush_cpus is at suspend: kernel does it itself */
 	if (flush_cpus)
 		sgx_flush_cpus(encl);
+
+	/**
+	 * NOTE: now that PTEs of all present TCSs are removed, any EENTER/ERESUME
+	 *       results in TCS page fault. However, since enclave is marked dead,
+	 *       page fault handler will EFAULT on this condition. In addition,
+	 *       all enclave threads were forced to AEX due to sgx_flush_cpus.
+	 *       Thus, now the whole enclave is exited and cannot be re-entered.
+	 */
 }
 
 static void sgx_ipi_cb(void *info)
 {
 }
 
+/* force all enclaves to AEX by sending dummy interrupt to all CPUs */
 void sgx_flush_cpus(struct sgx_encl *encl)
 {
 	on_each_cpu_mask(mm_cpumask(encl->mm), sgx_ipi_cb, NULL, 1);
@@ -156,6 +187,7 @@ void sgx_flush_cpus(struct sgx_encl *encl)
 
 /**
  * sgx_find_encl - find an enclave
+ *
  * @mm:		mm struct of the current process
  * @addr:	address in the ELRANGE
  * @vma:	the VMA that is located in the given address
@@ -186,6 +218,18 @@ int sgx_find_encl(struct mm_struct *mm, unsigned long addr,
 	return 0;
 }
 
+/**
+ * sgx_eldu - load-back previously swapped-out enclave page into EPC
+ *
+ * @encl:		corresponding enclave
+ * @encl_page:	enclave page to load-back
+ * @epc_page:	allocated EPC page where to load-back
+ * @is_secs:	true - load-back SECS page, false - normal page
+ *
+ * Finds backing RAM pages for swapped-out page content and PCMD and
+ * executes ENCLS(ELDU). Note that SECS page does not have virtual
+ * (linaddr) address, thus for SECS we leave this field NULL.
+ */
 static int sgx_eldu(struct sgx_encl *encl,
 		    struct sgx_encl_page *encl_page,
 		    struct sgx_epc_page *epc_page,
@@ -200,6 +244,7 @@ static int sgx_eldu(struct sgx_encl *encl,
 	void *va_ptr;
 	int ret;
 
+	/* find physical pages in backing RAM for page's content and PCMD */
 	pcmd_offset = ((encl_page->addr >> PAGE_SHIFT) & 31) * 128;
 
 	backing = sgx_get_backing(encl, encl_page, false);
@@ -228,6 +273,15 @@ static int sgx_eldu(struct sgx_encl *encl,
 	pginfo.linaddr = is_secs ? 0 : encl_page->addr;
 	pginfo.secs = (unsigned long)secs_ptr;
 
+	/**
+	 * ENCLS(ELDU) instruction with:
+	 *   pginfo.srcpge  - kernel address of backing EPC content page
+	 *   pginfo.pcmd    - kernel address of backing page with PCMD entry
+	 *   pginfo.linaddr - virtual address of enclave page to load-back
+	 *   pginfo.secs    - device address of SECS page
+	 *   epc_ptr        - device address of destination EPC page
+	 *   va_ptr         - device address of corresponding VA page
+	 */
 	ret = __eldu((unsigned long)&pginfo,
 		     (unsigned long)epc_ptr,
 		     (unsigned long)va_ptr +
@@ -245,13 +299,24 @@ static int sgx_eldu(struct sgx_encl *encl,
 	if (!is_secs)
 		sgx_put_page(secs_ptr);
 
-	sgx_put_backing(pcmd, false);
+	sgx_put_backing(pcmd, false /* write */);
 
 out:
-	sgx_put_backing(backing, false);
+	sgx_put_backing(backing, false /* write */);
 	return ret;
 }
 
+/**
+ * sgx_do_fault - handle page fault by loading-back (ELDU) enclave page
+ *
+ * @vma:	VMA that triggered fault
+ * @addr:	virtual addr that triggered fault
+ * @flags:	if SGX_FAULT_RESERVE, then in debug mode and need to retry
+ *
+ * Finds enclave page and loads it back via ELDU into free EPC page.
+ * On success, updates enclave VMA with virtual->physical mapping of page.
+ * If SECS page was evicted, first loads back it and then enclave page.
+ */
 static struct sgx_encl_page *sgx_do_fault(struct vm_area_struct *vma,
 					  unsigned long addr, unsigned int flags)
 {
@@ -270,6 +335,7 @@ static struct sgx_encl_page *sgx_do_fault(struct vm_area_struct *vma,
 
 	mutex_lock(&encl->lock);
 
+	/* find enclave page based on addr; validate enclave */
 	entry = radix_tree_lookup(&encl->page_tree, addr >> PAGE_SHIFT);
 	if (!entry) {
 		rc = -EFAULT;
@@ -301,6 +367,8 @@ static struct sgx_encl_page *sgx_do_fault(struct vm_area_struct *vma,
 		goto out;
 	}
 
+	/* try to grab a free EPC page; if no EPC pages are available,
+	 * -EBUSY is returned and benign VM_FAULT_NOPAGE triggered */
 	epc_page = sgx_alloc_page(SGX_ALLOC_ATOMIC);
 	if (IS_ERR(epc_page)) {
 		rc = PTR_ERR(epc_page);
@@ -317,6 +385,7 @@ static struct sgx_encl_page *sgx_do_fault(struct vm_area_struct *vma,
 			goto out;
 		}
 
+		/* load-back SECS via ELDU */
 		rc = sgx_eldu(encl, &encl->secs_page, secs_epc_page, true);
 		if (rc)
 			goto out;
@@ -328,6 +397,7 @@ static struct sgx_encl_page *sgx_do_fault(struct vm_area_struct *vma,
 		secs_epc_page = NULL;
 	}
 
+	/* load-back EPC page via ELDU */
 	rc = sgx_eldu(encl, entry, epc_page, false /* is_secs */);
 	if (rc)
 		goto out;
@@ -359,6 +429,7 @@ static struct sgx_encl_page *sgx_do_fault(struct vm_area_struct *vma,
 		goto out;
 	}
 
+	/* clear access bit of loaded-back enclave page */
 	sgx_test_and_clear_young(entry, encl);
 out:
 	mutex_unlock(&encl->lock);
@@ -369,6 +440,13 @@ out:
 	return rc ? ERR_PTR(rc) : entry;
 }
 
+/**
+ * sgx_fault_page - handle page fault
+ *
+ * @vma:	VMA that triggered fault
+ * @addr:	virtual addr that triggered fault
+ * @flags:	if SGX_FAULT_RESERVE, then in debug mode and need to retry
+ */
 struct sgx_encl_page *sgx_fault_page(struct vm_area_struct *vma,
 				     unsigned long addr,
 				     unsigned int flags)
@@ -384,6 +462,7 @@ struct sgx_encl_page *sgx_fault_page(struct vm_area_struct *vma,
 	return entry;
 }
 
+/* destroy enclave and all its pages */
 void sgx_encl_release(struct kref *ref)
 {
 	struct sgx_encl_page *entry;
@@ -392,15 +471,18 @@ void sgx_encl_release(struct kref *ref)
 	struct radix_tree_iter iter;
 	void **slot;
 
+	/* delete enclave from the list of enclaves inside TGID */
 	mutex_lock(&sgx_tgid_ctx_mutex);
 	if (!list_empty(&encl->encl_list))
 		list_del(&encl->encl_list);
 	mutex_unlock(&sgx_tgid_ctx_mutex);
 
+	/* unregister from MMU notifications */
 	if (encl->mmu_notifier.ops)
 		mmu_notifier_unregister_no_release(&encl->mmu_notifier,
 						   encl->mm);
 
+	/* EREMOVE all enclave pages (except VAs/SECS) from EPC and from tree */
 	radix_tree_for_each_slot(slot, &encl->page_tree, &iter, 0) {
 		entry = *slot;
 		if (entry->epc_page) {
@@ -411,6 +493,7 @@ void sgx_encl_release(struct kref *ref)
 		kfree(entry);
 	}
 
+	/* EREMOVE all VA pages from EPC and from list */
 	while (!list_empty(&encl->va_pages)) {
 		va_page = list_first_entry(&encl->va_pages,
 					   struct sgx_va_page, list);
@@ -419,6 +502,7 @@ void sgx_encl_release(struct kref *ref)
 		kfree(va_page);
 	}
 
+	/* EREMOVE SECS page */
 	if (encl->secs_page.epc_page)
 		sgx_free_page(encl->secs_page.epc_page, encl);
 

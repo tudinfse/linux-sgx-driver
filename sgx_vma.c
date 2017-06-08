@@ -69,8 +69,10 @@
 #include <linux/shmem_fs.h>
 #include <linux/mm.h>
 
+/* callback for open enclave-VMA operation, called at process fork */
 static void sgx_vma_open(struct vm_area_struct *vma)
 {
+	/* if host app mmaped enclave memory but didn't yet ECREATE enclave, nop */
 	struct sgx_encl *encl = vma->vm_private_data;
 	if (!encl)
 		return;
@@ -81,12 +83,15 @@ static void sgx_vma_open(struct vm_area_struct *vma)
 	kref_get(&encl->refcount);
 }
 
+/* callback for close enclave-VMA operation, called at process exit */
 static void sgx_vma_close(struct vm_area_struct *vma)
 {
+	/* if host app mmaped enclave memory but didn't yet ECREATE enclave, nop */
 	struct sgx_encl *encl = vma->vm_private_data;
 	if (!encl)
 		return;
 
+	/* remove PTEs for all pages of enclave in VMA and mark enclave dead */
 	mutex_lock(&encl->lock);
 	zap_vma_ptes(vma, vma->vm_start, vma->vm_end - vma->vm_start);
 	encl->flags |= SGX_ENCL_DEAD;
@@ -94,6 +99,7 @@ static void sgx_vma_close(struct vm_area_struct *vma)
 	kref_put(&encl->refcount, sgx_encl_release);
 }
 
+/* callback for fault enclave-VMA operation, at each in-enclave page fault */
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4,11,0))
 static int sgx_vma_fault(struct vm_fault *vmf)
 {
@@ -102,8 +108,6 @@ static int sgx_vma_fault(struct vm_fault *vmf)
 static int sgx_vma_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 {
 #endif
-	
-	
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4,10,0))
 	unsigned long addr = (unsigned long)vmf->address;
 #else
@@ -111,14 +115,30 @@ static int sgx_vma_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 #endif
 	struct sgx_encl_page *entry;
 
+	/* handle page fault via ELDU, do not retry if no free EPC pages */
 	entry = sgx_fault_page(vma, addr, 0);
 
+	/* NOTE: even if there is no free EPC page (EBUSY), still no error */
 	if (!IS_ERR(entry) || PTR_ERR(entry) == -EBUSY)
 		return VM_FAULT_NOPAGE;
 	else
 		return VM_FAULT_SIGBUS;
 }
 
+/**
+ * sgx_vma_access_word - debug read/write 64/32-bit word via EDBGRD/EDBGWR
+ *
+ * @encl:		corresponding enclave
+ * @addr:		virtual address to read/write
+ * @buf:		where to put EDBGRD result or from where to read EDBGWR input
+ * @len:		length of buffer
+ * @write:		true - execute EDBGWR, false - execute EDBGRD
+ * @encl_page:	enclave page where to read/write
+ * @i:			offset of buffer
+ *
+ * Reads/writes into/from buf in debug mode by executing ENCLS(EDBGRD/EDBGWR).
+ * Takes into account accesses not perfectly aligned to 64/32-bit word.
+ */
 static inline int sgx_vma_access_word(struct sgx_encl *encl,
 				      unsigned long addr,
 				      void *buf,
@@ -132,17 +152,21 @@ static inline int sgx_vma_access_word(struct sgx_encl *encl,
 	void *vaddr;
 	int ret;
 
+	/* find out how many bytes need to be read/written */
 	offset = ((addr + i) & (PAGE_SIZE - 1)) & ~(sizeof(unsigned long) - 1);
 	align = (addr + i) & (sizeof(unsigned long) - 1);
 	cnt = sizeof(unsigned long) - align;
 	cnt = min(cnt, len - i);
 
 	if (write) {
+		/* disallow writing to any field of TCS page except flags */
 		if (encl_page->flags & SGX_ENCL_PAGE_TCS &&
 		    (offset < 8 || (offset + (len - i)) > 16))
 			return -ECANCELED;
 
+		/* if write is not perfectly aligned or not exactly 64/32-bit */
 		if (align || (cnt != sizeof(unsigned long))) {
+			/* then need to augment write with data residing in other bits */
 			vaddr = sgx_get_page(encl_page->epc_page);
 			ret = __edbgrd((void *)((unsigned long)vaddr + offset),
 				       (unsigned long *)data);
@@ -153,6 +177,7 @@ static inline int sgx_vma_access_word(struct sgx_encl *encl,
 			}
 		}
 
+		/* copy EDBGWR input to data and execute EDBGWR instruction */
 		memcpy(data + align, buf + i, cnt);
 		vaddr = sgx_get_page(encl_page->epc_page);
 		ret = __edbgwr((void *)((unsigned long)vaddr + offset),
@@ -163,10 +188,12 @@ static inline int sgx_vma_access_word(struct sgx_encl *encl,
 			return -EFAULT;
 		}
 	} else {
+		/* disallow reading reserved fields of TCS page */
 		if (encl_page->flags & SGX_ENCL_PAGE_TCS &&
 		    (offset + (len - i)) > 72)
 			return -ECANCELED;
 
+		/* execute EDBGRD instruction and copy result in buf */
 		vaddr = sgx_get_page(encl_page->epc_page);
 		ret = __edbgrd((void *)((unsigned long)vaddr + offset),
 			       (unsigned long *)data);
@@ -182,6 +209,7 @@ static inline int sgx_vma_access_word(struct sgx_encl *encl,
 	return cnt;
 }
 
+/* callback for access enclave-VMA operation, for ptrace (thus gdb) peeks */
 static int sgx_vma_access(struct vm_area_struct *vma, unsigned long addr,
 			  void *buf, int len, int write)
 {
@@ -204,7 +232,9 @@ static int sgx_vma_access(struct vm_area_struct *vma, unsigned long addr,
 
 	sgx_dbg(encl, "%s addr=0x%lx, len=%d\n", op_str, addr, len);
 
+	/* since EDBGRD/EDBGWR access only 64/32-bit words, issue them in loop */
 	for (i = 0; i < len; i += ret) {
+		/* just in case, perform page fault to get enclave page into EPC */
 		if (!entry || !((addr + i) & (PAGE_SIZE - 1))) {
 			if (entry)
 				entry->flags &= ~SGX_ENCL_PAGE_RESERVED;
@@ -233,6 +263,7 @@ static int sgx_vma_access(struct vm_area_struct *vma, unsigned long addr,
 	return (ret < 0 && ret != -ECANCELED) ? ret : i;
 }
 
+/* VMA operations registered by driver on its mmap, see sgx_mmap() */
 const struct vm_operations_struct sgx_vm_ops = {
 	.close = sgx_vma_close,
 	.open = sgx_vma_open,

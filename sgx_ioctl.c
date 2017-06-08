@@ -73,6 +73,15 @@
 #include <linux/hashtable.h>
 #include <linux/shmem_fs.h>
 
+/**
+ * struct sgx_add_page_req - add-page request for sgx_add_page_worker
+ *
+ * @encl:       corresponding enclave
+ * @encl_page:  enclave page inited with ELRANGE address, EPC page, VA slot, etc.
+ * @secinfo:    SECINFO data (RWX/page type flags)
+ * @mrmask:	    bitmask for the 256 byte chunks that are to be measured
+ * @list:	    item in list of add-page requests
+ */
 struct sgx_add_page_req {
 	struct sgx_encl *encl;
 	struct sgx_encl_page *encl_page;
@@ -81,9 +90,12 @@ struct sgx_add_page_req {
 	struct list_head list;
 };
 
+/* minimum allowed Launch Enclave's isv svn (Security Version Number) */
 static u16 sgx_isvsvnle_min;
+/* # processes (with at least one enclave) serviced by driver */
 atomic_t sgx_nr_pids = ATOMIC_INIT(0);
 
+/* search through sgx_tgid_ctx_list and find TGID context for tgid PID */
 static struct sgx_tgid_ctx *sgx_find_tgid_ctx(struct pid *tgid)
 {
 	struct sgx_tgid_ctx *ctx;
@@ -95,16 +107,19 @@ static struct sgx_tgid_ctx *sgx_find_tgid_ctx(struct pid *tgid)
 	return NULL;
 }
 
+/* associate enclave with host app TGID context (create new if needed) */
 static int sgx_add_to_tgid_ctx(struct sgx_encl *encl)
 {
 	struct sgx_tgid_ctx *ctx;
-	struct pid *tgid = get_pid(task_tgid(current));
+	struct pid *tgid = get_pid(task_tgid(current)); /* PID of host app */
 
 	mutex_lock(&sgx_tgid_ctx_mutex);
 
+	/* first try to find TGID context for host app */
 	ctx = sgx_find_tgid_ctx(tgid);
 	if (ctx) {
 		if (kref_get_unless_zero(&ctx->refcount)) {
+			/* associate enclave with found TGID context */
 			encl->tgid_ctx = ctx;
 			mutex_unlock(&sgx_tgid_ctx_mutex);
 			put_pid(tgid);
@@ -114,6 +129,7 @@ static int sgx_add_to_tgid_ctx(struct sgx_encl *encl)
 			list_del_init(&ctx->list);
 	}
 
+	/* no TGID context yet (host app creates its first enclave), create one */
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx) {
 		mutex_unlock(&sgx_tgid_ctx_mutex);
@@ -134,6 +150,7 @@ static int sgx_add_to_tgid_ctx(struct sgx_encl *encl)
 	return 0;
 }
 
+/* remove unused TGID context; may be called on sgx_encl_release() */
 void sgx_tgid_ctx_release(struct kref *ref)
 {
 	struct sgx_tgid_ctx *pe =
@@ -146,6 +163,7 @@ void sgx_tgid_ctx_release(struct kref *ref)
 	kfree(pe);
 }
 
+/* find enclave containing addr, kref_get pointer to it, and return in encl */
 static int sgx_find_and_get_encl(unsigned long addr, struct sgx_encl **encl)
 {
 	struct mm_struct *mm = current->mm;
@@ -157,7 +175,7 @@ static int sgx_find_and_get_encl(unsigned long addr, struct sgx_encl **encl)
 	ret = sgx_find_encl(mm, addr, &vma);
 	if (!ret) {
 		*encl = vma->vm_private_data;
-		kref_get(&(*encl)->refcount);
+		kref_get(&(*encl)->refcount);  /* encl will be used in caller */
 	}
 
 	up_read(&mm->mmap_sem);
@@ -165,6 +183,14 @@ static int sgx_find_and_get_encl(unsigned long addr, struct sgx_encl **encl)
 	return ret;
 }
 
+/**
+ * sgx_measure - EEXTEND 256B chunks of EPC page based on mrmask
+ *
+ * @secs_page:  SECS page address identifying enclave
+ * @epc_page:   to-measure EPC page address
+ * @mrmask:     16-bit mask of chunks to measure
+ * @return 0 on success, negative on error
+ */
 static int sgx_measure(struct sgx_epc_page *secs_page,
 		       struct sgx_epc_page *epc_page,
 		       u16 mrmask)
@@ -174,6 +200,7 @@ static int sgx_measure(struct sgx_epc_page *secs_page,
 	int ret = 0;
 	int i, j;
 
+	/* go through 16 256B chunks of data and EEXTEND if specified in mrmask */
 	for (i = 0, j = 1; i < 0x1000 && !ret; i += 0x100, j <<= 1) {
 		if (!(j & mrmask))
 			continue;
@@ -181,6 +208,11 @@ static int sgx_measure(struct sgx_epc_page *secs_page,
 		secs = sgx_get_page(secs_page);
 		epc = sgx_get_page(epc_page);
 
+		/**
+		 * ENCLS(EEXTEND) instruction with:
+		 *   secs  - device address of SECS page (obsolete in SGX2 ???)
+		 *   epc+i - device address of 256B chunk of to-measure EPC page
+		 */
 		ret = __eextend(secs, (void *)((unsigned long)epc + i));
 
 		sgx_put_page(epc);
@@ -190,6 +222,16 @@ static int sgx_measure(struct sgx_epc_page *secs_page,
 	return ret;
 }
 
+/**
+ * sgx_add_page - EADD page to enclave from user-supplied backing RAM page
+ *
+ * @secs_page:  SECS page address identifying enclave
+ * @epc_page:   to-add EPC page address
+ * @linaddr:    address in the ELRANGE
+ * @secinfo:    SECINFO data (RWX/page type flags)
+ * @backing:    backing RAM page containing user-supplied data
+ * @return 0 on success, negative on error
+ */
 static int sgx_add_page(struct sgx_epc_page *secs_page,
 			struct sgx_epc_page *epc_page,
 			unsigned long linaddr,
@@ -200,12 +242,22 @@ static int sgx_add_page(struct sgx_epc_page *secs_page,
 	void *epc_page_vaddr;
 	int ret;
 
+	/* map src page in, get device addresses of SECS and EPC pages */
 	pginfo.srcpge = (unsigned long)kmap_atomic(backing);
 	pginfo.secs = (unsigned long)sgx_get_page(secs_page);
 	epc_page_vaddr = sgx_get_page(epc_page);
 
 	pginfo.linaddr = linaddr;
 	pginfo.secinfo = (unsigned long)secinfo;
+
+	/**
+	 * ENCLS(EADD) instruction with:
+	 *   pginfo.srcpge  - kernel address of source (user-supplied backing) page
+	 *   pginfo.secs    - device address of SECS
+	 *   pginfo.linaddr - virtual address in ELRANGE
+	 *   pginfo.secinfo - kernel address of SECINFO (RWX/page type flags)
+	 *   epc_page_vaddr - device address of to-add EPC page
+	 */
 	ret = __eadd(&pginfo, epc_page_vaddr);
 
 	sgx_put_page(epc_page_vaddr);
@@ -215,6 +267,15 @@ static int sgx_add_page(struct sgx_epc_page *secs_page,
 	return ret;
 }
 
+/**
+ * sgx_process_add_page_req - separate kernel thread EADDs enclave page
+ *
+ * @req:  add-page request with enclave page, SECINFO data, measurement chunks
+ * @return true on success, false on error
+ *
+ * Grabs physical EPC page, associates with virtual enclave page in VMA,
+ * adds page with EADD, and measure user-specified chunks of page with EEXTEND.
+ */
 static bool sgx_process_add_page_req(struct sgx_add_page_req *req)
 {
 	struct page *backing;
@@ -224,6 +285,7 @@ static bool sgx_process_add_page_req(struct sgx_add_page_req *req)
 	struct vm_area_struct *vma;
 	int ret;
 
+	/* grab free EPC page to write user-supplied data to */
 	epc_page = sgx_alloc_page(0);
 	if (IS_ERR(epc_page))
 		return false;
@@ -235,6 +297,7 @@ static bool sgx_process_add_page_req(struct sgx_add_page_req *req)
 	if (encl->flags & SGX_ENCL_DEAD)
 		goto out;
 
+	/* find VMA corresponding to enclave */
 	if (sgx_find_encl(encl->mm, encl_page->addr, &vma))
 		goto out;
 
@@ -244,47 +307,63 @@ static bool sgx_process_add_page_req(struct sgx_add_page_req *req)
 
 	/* Do not race with do_exit() */
 	if (!atomic_read(&encl->mm->mm_users)) {
-		sgx_put_backing(backing, 0);
+		sgx_put_backing(backing, 0);  /* should be false not 0 ??? */
 		goto out;
 	}
 
+	/* update enclave VMA with virtual->physical mapping of new page */
 	ret = vm_insert_pfn(vma, encl_page->addr, PFN_DOWN(epc_page->pa));
 	if (ret)
 		goto out;
 
+	/* actually add page with EADD */
 	ret = sgx_add_page(encl->secs_page.epc_page, epc_page,
 			   encl_page->addr, &req->secinfo, backing);
 
-	sgx_put_backing(backing, 0);
+	sgx_put_backing(backing, 0);  /* should be false not 0 ??? */
 	if (ret) {
 		sgx_warn(encl, "EADD returned %d\n", ret);
+		/* destroy VMA mapping made earlier with vm_insert_pfn() */
 		zap_vma_ptes(vma, encl_page->addr, PAGE_SIZE);
 		goto out;
 	}
 
+	/* increase number of loaded (present) EPC pages in enclave */
 	encl->secs_child_cnt++;
 
+	/* measure selected 256B chunks of page data with EEXTEND */
 	ret = sgx_measure(encl->secs_page.epc_page, epc_page, req->mrmask);
 	if (ret) {
 		sgx_warn(encl, "EEXTEND returned %d\n", ret);
+		/* destroy VMA mapping made earlier with vm_insert_pfn() */
 		zap_vma_ptes(vma, encl_page->addr, PAGE_SIZE);
 		goto out;
 	}
 
+	/* associate enclave page with new EPC page & mark as loaded in EPC */
 	encl_page->epc_page = epc_page;
-	sgx_test_and_clear_young(encl_page, encl);
+	sgx_test_and_clear_young(encl_page, encl);  /* clear access bit */
 	list_add_tail(&encl_page->load_list, &encl->load_list);
 
 	mutex_unlock(&encl->lock);
 	up_read(&encl->mm->mmap_sem);
 	return true;
 out:
+	/* cleanup in error case */
 	sgx_free_page(epc_page, encl);
 	mutex_unlock(&encl->lock);
 	up_read(&encl->mm->mmap_sem);
 	return false;
 }
 
+/**
+ * sgx_add_page_worker - separate kernel thread to EADD enclave pages
+ *
+ * @work:  needed only to identify enclave
+ *
+ * Worker is awaken each time when __encl_add_page() supplies at least one
+ * sgx_add_page_req request and keeps working until no more requests arrive.
+ */
 static void sgx_add_page_worker(struct work_struct *work)
 {
 	struct sgx_encl *encl;
@@ -292,14 +371,18 @@ static void sgx_add_page_worker(struct work_struct *work)
 	bool skip_rest = false;
 	bool is_empty = false;
 
+	/* identify enclave of this add-page worker */
 	encl = container_of(work, struct sgx_encl, add_page_work);
 
+	/* extract add-page requests until add_page_reqs list is empty */
 	do {
 		schedule();
 
+		/* if enclave became dead, do not EADD pages but still exhaust list */
 		if (encl->flags & SGX_ENCL_DEAD)
 			skip_rest = true;
 
+		/* extract one add-page request from list */
 		mutex_lock(&encl->lock);
 		req = list_first_entry(&encl->add_page_reqs,
 				       struct sgx_add_page_req, list);
@@ -308,6 +391,7 @@ static void sgx_add_page_worker(struct work_struct *work)
 		mutex_unlock(&encl->lock);
 
 		if (!skip_rest) {
+			/* try to process this request and perform EADD */
 			if (!sgx_process_add_page_req(req)) {
 				skip_rest = true;
 				sgx_dbg(encl, "EADD failed 0x%p\n",
@@ -355,6 +439,7 @@ static int sgx_validate_secs(const struct sgx_secs *secs)
 	if (((secs->xfrm >> 3) & 1) != ((secs->xfrm >> 4) & 1))
 		return -EINVAL;
 
+	/* Find biggest needed size for XSAVE area based on enclave's XFRM */
 	for (i = 2; i < 64; i++) {
 		tmp = sgx_ssaframesize_tbl[i];
 		if (((1 << i) & secs->xfrm) && (tmp > needed_ssaframesize))
@@ -388,6 +473,17 @@ static int sgx_validate_secs(const struct sgx_secs *secs)
 	return 0;
 }
 
+/**
+ * sgx_init_page - init entry with enclave page metadata
+ *
+ * @encl:   enclave containing entry page
+ * @entry:  enclave page to initialize
+ * @addr:   destination address in ELRANGE
+ * @return 0 on success, negative on error
+ *
+ * For allocated but uninitialized enclave page (entry), finds & assignes
+ * corresponding VA slot + set address from addr.
+ */
 static int sgx_init_page(struct sgx_encl *encl,
 			 struct sgx_encl_page *entry,
 			 unsigned long addr)
@@ -398,23 +494,29 @@ static int sgx_init_page(struct sgx_encl *encl,
 	void *vaddr;
 	int ret = 0;
 
+	/* iterate through all available VA pages in enclave, find first free
+	   VA slot, update VA page metadata, and return slot offset */
 	list_for_each_entry(va_page, &encl->va_pages, list) {
 		va_offset = sgx_alloc_va_slot(va_page);
 		if (va_offset < PAGE_SIZE)
 			break;
 	}
 
+	/* no free VA slot found, create new VA page and use slot from it */
 	if (va_offset == PAGE_SIZE) {
+		/* allocate metadata for VA; note that slots bitmap is all-zeros */
 		va_page = kzalloc(sizeof(*va_page), GFP_KERNEL);
 		if (!va_page)
 			return -ENOMEM;
 
+		/* grab free EPC page to be converted into VA page */
 		epc_page = sgx_alloc_page(0);
 		if (IS_ERR(epc_page)) {
 			kfree(va_page);
 			return PTR_ERR(epc_page);
 		}
 
+		/* translate EPC page address into device EPC bank+offset address */
 		vaddr = sgx_get_page(epc_page);
 		if (!vaddr) {
 			sgx_warn(encl, "kmap of a new VA page failed %d\n",
@@ -424,6 +526,10 @@ static int sgx_init_page(struct sgx_encl *encl,
 			return -EFAULT;
 		}
 
+		/**
+		 * ENCLS(EPA) instruction to convert page into Version Array page:
+		 *   vaddr  - device address of empty EPC page
+		 */
 		ret = __epa(vaddr);
 		sgx_put_page(vaddr);
 
@@ -434,9 +540,11 @@ static int sgx_init_page(struct sgx_encl *encl,
 			return -EFAULT;
 		}
 
+		/* fill metadata for newly created VA page and find free slot */
 		va_page->epc_page = epc_page;
 		va_offset = sgx_alloc_va_slot(va_page);
 
+		/* add VA page to list of available VA pages of enclave */
 		mutex_lock(&encl->lock);
 		list_add(&va_page->list, &encl->va_pages);
 		mutex_unlock(&encl->lock);
@@ -449,6 +557,7 @@ static int sgx_init_page(struct sgx_encl *encl,
 	return 0;
 }
 
+/* if host notifies about release of host-app memory, declare enclave dead */
 static void sgx_mmu_notifier_release(struct mmu_notifier *mn,
 				     struct mm_struct *mm)
 {
@@ -466,9 +575,11 @@ static const struct mmu_notifier_ops sgx_mmu_notifier_ops = {
 
 /**
  * sgx_ioc_enclave_create - handler for SGX_IOC_ENCLAVE_CREATE
+ *
  * @filep:	open file to /dev/sgx
  * @cmd:	the command value
  * @arg:	pointer to the struct sgx_enclave_create
+ * @return 0 on success, negative on error
  *
  * Creates meta-data for an enclave and executes ENCLS(ECREATE)
  */
@@ -503,6 +614,8 @@ static long sgx_ioc_enclave_create(struct file *filep, unsigned int cmd,
 		return -EINVAL;
 	}
 
+	/* anonymous RAM memory region for EPC pages' content;
+	   size of enclave + one additional page for SECS */
 	backing = shmem_file_setup("dev/sgx", secs->size + PAGE_SIZE,
 				   VM_NORESERVE);
 	if (IS_ERR(backing)) {
@@ -510,6 +623,8 @@ static long sgx_ioc_enclave_create(struct file *filep, unsigned int cmd,
 		goto out;
 	}
 
+	/* anonymous RAM memory region for EPC pages' metadata (PCMD);
+	   divide by 32 since one 4KB page corresponds to one 128B PCMD entry */
 	pcmd = shmem_file_setup("dev/sgx",
 				(secs->size + PAGE_SIZE) >> 5,
 				VM_NORESERVE);
@@ -536,12 +651,13 @@ static long sgx_ioc_enclave_create(struct file *filep, unsigned int cmd,
 	mutex_init(&encl->lock);
 	INIT_WORK(&encl->add_page_work, sgx_add_page_worker);
 
-	encl->mm = current->mm;
+	encl->mm = current->mm;	  /* current is process that issued syscall */
 	encl->base = secs->base;
 	encl->size = secs->size;
 	encl->backing = backing;
 	encl->pcmd = pcmd;
 
+	/* grab free EPC page to serve as SECS page */
 	secs_epc = sgx_alloc_page(0);
 	if (IS_ERR(secs_epc)) {
 		ret = PTR_ERR(secs_epc);
@@ -549,15 +665,19 @@ static long sgx_ioc_enclave_create(struct file *filep, unsigned int cmd,
 		goto out;
 	}
 
+	/* associate enclave with host app TGID context (create new if needed) */
 	ret = sgx_add_to_tgid_ctx(encl);
 	if (ret)
 		goto out;
 
+	/* init enclave secs_page: find & assign corresponding VA slot +
+	   set address to right after ELRANGE (to differentiate from other pages) */
 	ret = sgx_init_page(encl, &encl->secs_page,
 			    encl->base + encl->size);
 	if (ret)
 		goto out;
 
+	/* translate EPC page address into device EPC bank+offset address */
 	secs_vaddr = sgx_get_page(secs_epc);
 
 	pginfo.srcpge = (unsigned long)secs;
@@ -565,6 +685,13 @@ static long sgx_ioc_enclave_create(struct file *filep, unsigned int cmd,
 	pginfo.secinfo = (unsigned long)&secinfo;
 	pginfo.secs = 0;
 	memset(&secinfo, 0, sizeof(secinfo));
+
+	/**
+	 * ENCLS(ECREATE) instruction with:
+	 *   pginfo.srcpge  - kernel address of source SECS page
+	 *   pginfo.<other> - unused, set to zero
+	 *   secs_vaddr     - device address of destination SECS page
+	 */
 	ret = __ecreate((void *)&pginfo, secs_vaddr);
 
 	sgx_put_page(secs_vaddr);
@@ -575,13 +702,15 @@ static long sgx_ioc_enclave_create(struct file *filep, unsigned int cmd,
 		goto out;
 	}
 
+	/* finish initing secs_page: associate EPC page */
 	encl->secs_page.epc_page = secs_epc;
-	createp->src = (unsigned long)encl->base;
+	createp->src = (unsigned long)encl->base;  /* DEADCODE ??? */
 
 	if (secs->flags & SGX_SECS_A_DEBUG)
 		encl->flags |= SGX_ENCL_DEBUG;
 
 
+	/* register for the release notification from host */
 	encl->mmu_notifier.ops = &sgx_mmu_notifier_ops;
 	ret = mmu_notifier_register(&encl->mmu_notifier, encl->mm);
 	if (ret) {
@@ -589,6 +718,7 @@ static long sgx_ioc_enclave_create(struct file *filep, unsigned int cmd,
 		goto out;
 	}
 
+	/* find and double-check previously mmaped (by host app) enclave region */
 	down_read(&current->mm->mmap_sem);
 	vma = find_vma(current->mm, secs->base);
 	if (!vma || vma->vm_ops != &sgx_vm_ops ||
@@ -598,9 +728,10 @@ static long sgx_ioc_enclave_create(struct file *filep, unsigned int cmd,
 		up_read(&current->mm->mmap_sem);
 		goto out;
 	}
-	vma->vm_private_data = encl;
+	vma->vm_private_data = encl;      /* associate VMA with created enclave */
 	up_read(&current->mm->mmap_sem);
 
+	/* append enclave to list of enclaves of host app TGID context */
 	mutex_lock(&sgx_tgid_ctx_mutex);
 	list_add_tail(&encl->encl_list, &encl->tgid_ctx->encl_list);
 	mutex_unlock(&sgx_tgid_ctx_mutex);
@@ -612,6 +743,7 @@ out:
 	return ret;
 }
 
+/* SECINFO validation: page-to-add must be TCS/REG, with correct flags, etc. */
 static int sgx_validate_secinfo(struct sgx_secinfo *secinfo)
 {
 	u64 perm = secinfo->flags & SGX_SECINFO_PERMISSION_MASK;
@@ -631,6 +763,7 @@ static int sgx_validate_secinfo(struct sgx_secinfo *secinfo)
 	return 0;
 }
 
+/* TCS user-supplied page validation: correct alignments of addresses */
 static int sgx_validate_tcs(struct sgx_tcs *tcs)
 {
 	int i;
@@ -651,6 +784,19 @@ static int sgx_validate_tcs(struct sgx_tcs *tcs)
 	return 0;
 }
 
+/**
+ * __encl_add_page - part of handler for SGX_IOC_ENCLAVE_ADD_PAGE
+ *
+ * @encl:	    corresponding enclave
+ * @encl_page:	allocated enclave page that will receive contents of user page
+ * @addp:       add-page struct with src & dst pages' addresses, mrmask, secinfo
+ * @secinfo:    user-supplied SECS
+ *
+ * Validates user-supplied structures and prepare objects for worker thread
+ * sgx_add_page_worker to pick up and perform actual EADD+EEXTEND;
+ * these objects are temporary copy of user-supplied page in backing RAM page
+ * and sgx_add_page_req request inited with page-info and added to worker list.
+ */
 static int __encl_add_page(struct sgx_encl *encl,
 			   struct sgx_encl_page *encl_page,
 			   struct sgx_enclave_add_page *addp,
@@ -667,10 +813,12 @@ static int __encl_add_page(struct sgx_encl *encl,
 	void *tmp_vaddr;
 	struct page *tmp_page;
 
-	tmp_page = alloc_page(GFP_HIGHUSER);
+	/* allocate temporary page to receive contents of user page & be checked */
+	tmp_page = alloc_page(GFP_HIGHUSER);  /* page not yet mapped in kernel AS */
 	if (!tmp_page)
 		return -ENOMEM;
 
+	/* temporarily map into kernel AS and fill with contents from user page */
 	tmp_vaddr = kmap(tmp_page);
 	ret = copy_from_user((void *)tmp_vaddr, (void __user *)src, PAGE_SIZE);
 	kunmap(tmp_page);
@@ -679,11 +827,13 @@ static int __encl_add_page(struct sgx_encl *encl,
 		return -EFAULT;
 	}
 
+	/* validate user-supplied SECINFO (page is TCS/REG, with correct flags) */
 	if (sgx_validate_secinfo(secinfo)) {
 		__free_page(tmp_page);
 		return -EINVAL;
 	}
 
+	/* if page is TCS, validate contents of this page (correct alignments) */
 	if (page_type == SGX_SECINFO_TCS) {
 		tcs = (struct sgx_tcs *)kmap(tmp_page);
 		ret = sgx_validate_tcs(tcs);
@@ -694,6 +844,7 @@ static int __encl_add_page(struct sgx_encl *encl,
 		}
 	}
 
+	/* init enclave page: find & assign corresponding VA slot + set address */
 	ret = sgx_init_page(encl, encl_page, addp->addr);
 	if (ret) {
 		__free_page(tmp_page);
@@ -702,28 +853,33 @@ static int __encl_add_page(struct sgx_encl *encl,
 
 	mutex_lock(&encl->lock);
 
+	/* maybe cannot add pages anymore? */
 	if (encl->flags & (SGX_ENCL_INITIALIZED | SGX_ENCL_DEAD)) {
 		ret = -EINVAL;
 		goto out;
 	}
 
+	/* is page with same address already in enclave? */
 	if (radix_tree_lookup(&encl->page_tree, addp->addr >> PAGE_SHIFT)) {
 		ret = -EEXIST;
 		goto out;
 	}
 
+	/* allocate request object to be EADDed later by sgx_add_page_worker */
 	req = kzalloc(sizeof(*req), GFP_KERNEL);
 	if (!req) {
 		ret = -ENOMEM;
 		goto out;
 	}
 
+	/* find backing RAM page for our enclave page (used as tmp storage) */
 	backing = sgx_get_backing(encl, encl_page, false);
 	if (IS_ERR((void *)backing)) {
 		ret = PTR_ERR((void *)backing);
 		goto out;
 	}
 
+	/* register enclave page in enclave */
 	ret = radix_tree_insert(&encl->page_tree, encl_page->addr >> PAGE_SHIFT,
 				encl_page);
 	if (ret) {
@@ -731,6 +887,7 @@ static int __encl_add_page(struct sgx_encl *encl,
 		goto out;
 	}
 
+	/* copy user-supplied page to backing storage (fetched later by sgx_add_page_worker) */
 	user_vaddr = kmap(backing);
 	tmp_vaddr = kmap(tmp_page);
 	memcpy(user_vaddr, tmp_vaddr, PAGE_SIZE);
@@ -740,6 +897,7 @@ static int __encl_add_page(struct sgx_encl *encl,
 	if (page_type == SGX_SECINFO_TCS)
 		encl_page->flags |= SGX_ENCL_PAGE_TCS;
 
+	/* init request object with info needed for EADD */
 	memcpy(&req->secinfo, secinfo, sizeof(*secinfo));
 
 	req->encl = encl;
@@ -747,6 +905,8 @@ static int __encl_add_page(struct sgx_encl *encl,
 	req->mrmask = addp->mrmask;
 	empty = list_empty(&encl->add_page_reqs);
 	kref_get(&encl->refcount);
+
+	/* add request to enclave's list of requests & start worker if necessary */
 	list_add_tail(&req->list, &encl->add_page_reqs);
 	if (empty)
 		queue_work(sgx_add_page_wq, &encl->add_page_work);
@@ -785,22 +945,26 @@ static long sgx_ioc_enclave_add_page(struct file *filep, unsigned int cmd,
 	struct sgx_secinfo secinfo;
 	int ret;
 
+	/* destination address in ELRANGE must be 4KB aligned */
 	if (addp->addr & (PAGE_SIZE - 1))
 		return -EINVAL;
 
 	if (copy_from_user(&secinfo, (void __user *)secinfop, sizeof(secinfo)))
 		return -EFAULT;
 
+	/* find and kref_get enclave corresponding to destination address */
 	ret = sgx_find_and_get_encl(addp->addr, &encl);
 	if (ret)
 		return ret;
 
+	/* sanity check: found enclave does not contain destination address */
 	if (addp->addr < encl->base ||
 	    addp->addr > (encl->base + encl->size - PAGE_SIZE)) {
 		kref_put(&encl->refcount, sgx_encl_release);
 		return -EINVAL;
 	}
 
+	/* allocate enclave page that will receive contents of src user page */
 	page = kzalloc(sizeof(*page), GFP_KERNEL);
 	if (!page) {
 		kref_put(&encl->refcount, sgx_encl_release);
@@ -816,31 +980,51 @@ static long sgx_ioc_enclave_add_page(struct file *filep, unsigned int cmd,
 	return ret;
 }
 
+/**
+ * __sgx_encl_init - part of handler for SGX_IOC_ENCLAVE_INIT
+ *
+ * @encl:	    to-initialize enclave
+ * @sigstruct:	kernel address of user-supplied SIGSTRUCT
+ * @einittoken:	kernel address of user-supplied EINITTOKEN
+ *
+ * Calls EINIT, retries several times on failure.
+ */
 static int __sgx_encl_init(struct sgx_encl *encl, char *sigstruct,
 			   struct sgx_einittoken *einittoken)
 {
-	int ret = SGX_UNMASKED_EVENT;
+	int ret = SGX_UNMASKED_EVENT;  /* if EINIT returns this, should retry */
 	struct sgx_epc_page *secs_epc = encl->secs_page.epc_page;
 	void *secs_va = NULL;
 	int i;
 	int j;
 
+	/* Launch Enclave's isv svn of the license is not supported (too small) */
 	if (einittoken->valid && einittoken->isvsvnle < sgx_isvsvnle_min)
 		return SGX_LE_ROLLBACK;
 
+	/* Retry several times because EINIT might fail due to interrupt storm */
 	for (i = 0; i < SGX_EINIT_SLEEP_COUNT; i++) {
 		for (j = 0; j < SGX_EINIT_SPIN_COUNT; j++) {
 			mutex_lock(&encl->lock);
 			secs_va = sgx_get_page(secs_epc);
+
+			/**
+			 * ENCLS(EINIT) instruction with:
+			 *   sigstruct  - kernel address of SIGSTRUCT
+			 *   einittoken - kernel address of EINITTOKEN
+			 *   secs_va    - device address of enclave's SECS page
+			 */
 			ret = __einit(sigstruct, einittoken, secs_va);
+
 			sgx_put_page(secs_va);
 			mutex_unlock(&encl->lock);
 			if (ret == SGX_UNMASKED_EVENT)
-				continue;
+				continue;  /* unnecessary ??? */
 			else
 				break;
 		}
 
+		/* EINIT was interrupted, sleep a bit and retry */
 		if (ret != SGX_UNMASKED_EVENT)
 			goto out;
 
@@ -853,8 +1037,10 @@ out:
 	if (ret) {
 		sgx_dbg(encl, "EINIT returned %d\n", ret);
 	} else {
+		/* success, mark enclave as initialized */
 		encl->flags |= SGX_ENCL_INITIALIZED;
 
+		/* update minimum allowed Launch Enclave's isv svn */
 		if (einittoken->isvsvnle > sgx_isvsvnle_min)
 			sgx_isvsvnle_min = einittoken->isvsvnle;
 	}
@@ -886,10 +1072,12 @@ static long sgx_ioc_enclave_init(struct file *filep, unsigned int cmd,
 	struct page *initp_page;
 	int ret;
 
+	/* allocate temporary page to receive contents of SIGSTRUCT and EINITTOKEN */
 	initp_page = alloc_page(GFP_HIGHUSER);
 	if (!initp_page)
 		return -ENOMEM;
 
+	/* half of allocated page stores SIGSTRUCT, other half -- EINITTOKEN */
 	sigstruct = kmap(initp_page);
 	einittoken = (struct sgx_einittoken *)
 		((unsigned long)sigstruct + PAGE_SIZE / 2);
@@ -904,10 +1092,12 @@ static long sgx_ioc_enclave_init(struct file *filep, unsigned int cmd,
 	if (ret)
 		goto out_free_page;
 
+	/* find and kref_get enclave corresponding to SECS address (encl_id) */
 	ret = sgx_find_and_get_encl(encl_id, &encl);
 	if (ret)
 		goto out_free_page;
 
+	/* no point in re-initializing enclave */
 	mutex_lock(&encl->lock);
 	if (encl->flags & SGX_ENCL_INITIALIZED) {
 		ret = -EINVAL;
@@ -916,6 +1106,7 @@ static long sgx_ioc_enclave_init(struct file *filep, unsigned int cmd,
 	}
 	mutex_unlock(&encl->lock);
 
+	/* block until all pending enclave pages are EADDed by worker thread */
 	flush_work(&encl->add_page_work);
 
 	ret = __sgx_encl_init(encl, sigstruct, einittoken);
@@ -930,6 +1121,7 @@ out_free_page:
 typedef long (*sgx_ioc_t)(struct file *filep, unsigned int cmd,
 			  unsigned long arg);
 
+/* general handler for IOCTL syscall invoked by host app */
 long sgx_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 {
 	char data[256];

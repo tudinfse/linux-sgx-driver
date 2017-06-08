@@ -1,3 +1,5 @@
+(This is an unofficial fork of Intel SGX Driver, with source code augmented with comments and high-level documentation under `documentation/`.)
+
 Intel(R) Software Guard Extensions for Linux\* OS
 ================================================
 

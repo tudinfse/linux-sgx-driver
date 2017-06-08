@@ -75,14 +75,23 @@
 #define SGX_EINIT_SLEEP_COUNT	50
 #define SGX_EINIT_SLEEP_TIME	20
 
+/* # slots in one VA page (4KB page size / 8B nonce-slot) */
 #define SGX_VA_SLOT_COUNT 512
 
+/**
+ * struct sgx_va_page - Metadata for VA page (special type of EPC page)
+ *
+ * @epc_page:  corresponding EPC page
+ * @slots:     bitvector indicating occupied/free VA slots
+ * @list:      item in list of enclave's VA pages
+ */
 struct sgx_va_page {
 	struct sgx_epc_page *epc_page;
 	DECLARE_BITMAP(slots, SGX_VA_SLOT_COUNT);
 	struct list_head list;
 };
 
+/* Find first free VA slot, update VA page metadata, and return slot offset */
 static inline unsigned int sgx_alloc_va_slot(struct sgx_va_page *page)
 {
 	int slot = find_first_zero_bit(page->slots, SGX_VA_SLOT_COUNT);
@@ -90,20 +99,32 @@ static inline unsigned int sgx_alloc_va_slot(struct sgx_va_page *page)
 	if (slot < SGX_VA_SLOT_COUNT)
 		set_bit(slot, page->slots);
 
-	return slot << 3;
+	return slot << 3; /* each slot is 8 bytes in size */
 }
 
+/* Update VA page metadata (slots) to indicate a freed slot */
 static inline void sgx_free_va_slot(struct sgx_va_page *page,
 				    unsigned int offset)
 {
 	clear_bit(offset >> 3, page->slots);
 }
 
+/* Metadata flags for enclave pages: is it TCS page? is it reserved? */
 enum sgx_encl_page_flags {
 	SGX_ENCL_PAGE_TCS	= BIT(0),
-	SGX_ENCL_PAGE_RESERVED	= BIT(1),
+	SGX_ENCL_PAGE_RESERVED	= BIT(1),  /* used for debug, what exactly it does ??? */
 };
 
+/**
+ * struct sgx_encl_page - Metadata for enclave page
+ *
+ * @addr:       address in the ELRANGE
+ * @flags:      tcs page, reserved
+ * @epc_page:   corresponding EPC page
+ * @load_list:  item in list of loaded (present) enclave pages
+ * @va_page:    corresponding VA page storing slot with nonce
+ * @va_offset:  corresponding slot with nonce in VA page
+ */
 struct sgx_encl_page {
 	unsigned long addr;
 	unsigned int flags;
@@ -113,6 +134,15 @@ struct sgx_encl_page {
 	unsigned int va_offset;
 };
 
+/**
+ * struct sgx_tgid_ctx - Thread Group ID (TGID) context: driver keeps track
+ *                       of many threads in many enclaves (several enclaves
+ *                       are grouped in one TGID)
+ * @tgid:       corresponding kernel PID
+ * @refcount:   kref to correctly release unused TGID
+ * @encl_list:  head of list of enclaves inside this TGID (see sgx_encl)
+ * @list:       item in list of TGID contexts
+ */
 struct sgx_tgid_ctx {
 	struct pid *tgid;
 	struct kref refcount;
@@ -120,6 +150,7 @@ struct sgx_tgid_ctx {
 	struct list_head list;
 };
 
+/* Metadata flags for enclave: is it initialized? is it in debug mode? etc. */
 enum sgx_encl_flags {
 	SGX_ENCL_INITIALIZED	= BIT(0),
 	SGX_ENCL_DEBUG		= BIT(1),
@@ -128,6 +159,28 @@ enum sgx_encl_flags {
 	SGX_ENCL_DEAD		= BIT(4),
 };
 
+/**
+ * struct sgx_encl - Metadata for enclave
+ *
+ * @flags:           initialized, debug, dead, etc.
+ * @secs_child_cnt:  # loaded (present) EPC pages, used to evict SECS page when secs_child_cnt=0
+ * @lock:            global enclave lock
+ * @mm:              memory descriptor: VMAs, amount of physical/virtual memory, etc.
+ * @backing:         normal-RAM pages backing EPC pages, used for page-add and eviction (implemented as shmem)
+ * @pcmd:            Paging Crypto MetaData for evicted pages (implemented as shmem)
+ * @load_list:       head of list of loaded enclave pages (see sgx_encl_page)
+ * @refcount:        kref to correctly release unused enclave
+ * @base:            base of enclave's ELRANGE
+ * @size:            size of enclave's ELRANGE
+ * @va_pages:        head of list of enclave's VA pages (see sgx_va_page)
+ * @page_tree:       tree of all enclave pages (except VAs/SECS), with key = addr>>PAGE_SHIFT and value = &sgx_encl_page
+ * @add_page_reqs:   head of list of add-page requests asynchronously processed by page worker (see sgx_add_page_req)
+ * @add_page_work:   work of add_page_reqs deferred to sgx_add_page_worker()
+ * @secs_page:       SECS enclave page
+ * @tgid_ctx:        enclosing TGID context
+ * @encl_list:       item in list of enclaves with same TGID
+ * @mmu_notifier:    if host notifies about release, then declare enclave SGX_ENCL_DEAD
+ */
 struct sgx_encl {
 	unsigned int flags;
 	unsigned int secs_child_cnt;
@@ -149,6 +202,13 @@ struct sgx_encl {
 	struct mmu_notifier mmu_notifier;
 };
 
+/**
+ * struct sgx_epc_bank - server can be equipped with several EPC banks, so
+ *                       SGX page cache searches for enclave pages in them
+ * @mem:    remapped device memory (only for x64)
+ * @start:  device memory start
+ * @end:    device memory end
+ */
 struct sgx_epc_bank {
 #ifdef CONFIG_X86_64
 	void *mem;
@@ -204,6 +264,11 @@ void sgx_flush_cpus(struct sgx_encl *encl);
 int sgx_find_encl(struct mm_struct *mm, unsigned long addr,
 		  struct vm_area_struct **vma);
 
+/**
+ * SGX_FAULT_RESERVE is used for debug (vm_operations_struct.access):
+ *   debug write/read access may require several EPC page faults
+ *   to bring those pages which contain the requested data in EPC
+ */
 enum sgx_fault_flags {
 	SGX_FAULT_RESERVE	= BIT(0),
 };
@@ -219,6 +284,13 @@ extern struct mutex sgx_tgid_ctx_mutex;
 extern struct list_head sgx_tgid_ctx_list;
 extern struct task_struct *ksgxswapd_tsk;
 
+/**
+ *  SGX_ALLOC_ATOMIC is set for major page faults and unset for
+ *  init/addition of SECS/VA/normal pages; SGX_ALLOC_ATOMIC allows
+ *  to ignore page faults if ksgxswapd daemon is overloaded and
+ *  cannot swap-out pages to provide free page for this page fault
+ *  (in this case, fault happens again and again till a page is freed)
+ */
 enum sgx_alloc_flags {
 	SGX_ALLOC_ATOMIC	= BIT(0),
 };

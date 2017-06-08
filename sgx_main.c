@@ -93,25 +93,33 @@ int sgx_nr_epc_banks;
 u64 sgx_encl_size_max_32 = ENCL_SIZE_MAX_32;
 u64 sgx_encl_size_max_64 = ENCL_SIZE_MAX_64;
 u64 sgx_xfrm_mask = 0x3;
-u32 sgx_ssaframesize_tbl[64];
+u32 sgx_ssaframesize_tbl[64];	/* frame sizes for different XFRM */
 bool sgx_has_sgx2;
 
 #ifdef CONFIG_COMPAT
+/* handler for IOCTL syscall invoked by host app (compatibility mode) */
 long sgx_compat_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 {
 	return sgx_ioctl(filep, cmd, arg);
 }
 #endif
 
+/* handler for mmap syscall invoked by host app (to alloc enclave memory) */
 static int sgx_mmap(struct file *file, struct vm_area_struct *vma)
 {
+	/* all real allocations happen at IOCTL(SGX_IOC_ENCLAVE_CREATE);
+	   here we only register VMA operations like open/close/page fault */
 	vma->vm_ops = &sgx_vm_ops;
+
+	/* use pure PFN, cannot expand with mremap, do not include in core dump,
+	   treat as memory-mapped IO, do not copy on fork */
 	vma->vm_flags |= VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP | VM_IO |
 			 VM_DONTCOPY;
 
 	return 0;
 }
 
+/* handler for get_unmapped_area ??? */
 static unsigned long sgx_get_unmapped_area(struct file *file,
 					   unsigned long addr,
 					   unsigned long len,
@@ -148,6 +156,7 @@ static unsigned long sgx_get_unmapped_area(struct file *file,
 	return addr;
 }
 
+/* callbacks for isgx device: IOCTL & mmap syscalls */
 static const struct file_operations sgx_fops = {
 	.owner			= THIS_MODULE,
 	.unlocked_ioctl		= sgx_ioctl,
@@ -161,9 +170,10 @@ static const struct file_operations sgx_fops = {
 static struct miscdevice sgx_dev = {
 	.name	= "isgx",
 	.fops	= &sgx_fops,
-	.mode   = 0666,
+	.mode   = 0666,  /* read/write access to all */
 };
 
+/* check that CPU and BIOS support SGX & detect valid XFRM + PRM sections */
 static int sgx_init_platform(void)
 {
 	unsigned int eax, ebx, ecx, edx;
@@ -236,6 +246,7 @@ static int sgx_init_platform(void)
 	return 0;
 }
 
+/* since on suspend SGX keys are erased, need to invalidate all SGX enclaves */
 static int sgx_pm_suspend(struct device *dev)
 {
 	struct sgx_tgid_ctx *ctx;
@@ -244,6 +255,7 @@ static int sgx_pm_suspend(struct device *dev)
 	kthread_stop(ksgxswapd_tsk);
 	ksgxswapd_tsk = NULL;
 
+	/* go through all host apps and their enclaves and invalidate all */
 	list_for_each_entry(ctx, &sgx_tgid_ctx_list, list) {
 		list_for_each_entry(encl, &ctx->encl_list, encl_list) {
 			sgx_invalidate(encl, false);
@@ -255,14 +267,18 @@ static int sgx_pm_suspend(struct device *dev)
 	return 0;
 }
 
+/* on resume from suspend, restart kswapd background thread */
 static int sgx_pm_resume(struct device *dev)
 {
 	ksgxswapd_tsk = kthread_run(ksgxswapd, NULL, "kswapd");
 	return 0;
 }
 
+/* callbacks for power-management (suspend/hibernate) */
 static SIMPLE_DEV_PM_OPS(sgx_drv_pm, sgx_pm_suspend, sgx_pm_resume);
 
+/* call sgx_init_platform(), remap PRM memory & init page cache with it,
+   create add-page work queue, and register SGX driver */
 static int sgx_dev_init(struct device *dev)
 {
 	unsigned int wq_flags;
@@ -292,6 +308,7 @@ static int sgx_dev_init(struct device *dev)
 			goto out_iounmap;
 		}
 #endif
+		/* sgx_page_cache_init() calls kthread_run() -- doesn't it create many background threads ??? */
 		ret = sgx_page_cache_init(sgx_epc_banks[i].start,
 			sgx_epc_banks[i].end - sgx_epc_banks[i].start);
 		if (ret) {
@@ -329,6 +346,7 @@ out_iounmap:
 	return ret;
 }
 
+/* duplicates functionality of sgx_init_platform() ??? */
 static int sgx_drv_probe(struct platform_device *pdev)
 {
 	unsigned int eax, ebx, ecx, edx;
@@ -379,6 +397,7 @@ static int sgx_drv_probe(struct platform_device *pdev)
 	return sgx_dev_init(&pdev->dev);
 }
 
+/* unregister driver, remove work queue, unmap EPC banks, destroy page cache */
 static int sgx_drv_remove(struct platform_device *pdev)
 {
 	int i;
