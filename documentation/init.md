@@ -29,21 +29,21 @@ The enclave's resources, however, are actually released (all enclave pages remov
 **TODO:** Still unclear why this is needed if the enclave is released only later.
 
 
-## Understanding PRM and EPC Banks
+## PRM and EPC Banks
 
 Obtaining and releasing physical device addesses for EPC pages is encapsulated in `sgx_get_page()` and `sgx_put_page()` respectively.
 These addresses can reside in any of the EPC banks, which are detected and registered in an array `sgx_epc_banks` at driver initialization.
-Each EPC bank is described by the `sgx_epc_bank` object, with `sgx_epc_bank.start` and `sgx_epc_bank.end` containining a physical memory range of PRM (EPC bank).
+Each EPC bank is described by the `sgx_epc_bank` object, with `sgx_epc_bank.start` and `sgx_epc_bank.end` containining a physical memory range of PRM.
 
 Since the driver works with kernel addresses and not physical addresses, it needs a mapping "PRM physical address -> kernel virtual address".
 This mapping is achieved by two actions:
 1. remapping of each EPC bank's physical base address to get kernel virtual base address: `sgx_epc_bank.mem = ioremap_cache()`;
 2. given physical address `pa` and kernel base address, returning the kernel address: `sgx_epc_bank.mem + (pa - sgx_epc_bank.start)`; this functionality is encapsulated in `sgx_get_page()`.
 
-Note how `ioremap_cache()` is used and not `ioremap()` -- this function enables caching of PRM pages in kernel for performance.
+Note how `ioremap_cache()` is used and not `ioremap()` -- this function enables caching of PRM pages in CPU (using PAT) for performance.
 Also note that this remapping is only needed for 64-bit mode (**TODO**: 32-bit mode cannot have more than one EPC bank?).
 
-For additional details, see https://software.intel.com/sites/default/files/managed/48/88/329298-002.pdf , see section 1.7.2 (pages 5-6) and https://lwn.net/Articles/282250/ .
+For additional details, see <https://software.intel.com/sites/default/files/managed/48/88/329298-002.pdf> (section 1.7.2, pages 5-6) and <https://lwn.net/Articles/282250/>.
 
 ## Power Management in Enclaves and SGX Driver
 
@@ -63,16 +63,17 @@ platform and use this information to restore the enclave to its original state a
 > 
 > -- <cite> https://download.01.org/intel-sgx/linux-1.7/docs/Intel_SGX_SDK_Developer_Reference_Linux_1.7_Open_Source.pdf </cite>
 
-According to this, the driver registers power-management (`driver.pm`) callbacks:
-1. `sgx_pm_suspend` for suspend/hibernate, for *all current enclaves*:
+According to this, the driver registers power-management (`driver.pm`) callbacks: `sgx_pm_suspend` for suspend/hibernate and `sgx_pm_resume` for resume.
+They perform the following actions:
+1. `sgx_pm_suspend` (for *all current enclaves*):
     - invalidates enclave by removing PTEs for TCS pages
     - marks enclave as dead and suspended thus disallowing any SGX-related actions
     - stops the background `ksgxswapd` thread
-2. `sgx_pm_resume` for resume:
+2. `sgx_pm_resume`:
     - restarts the background `ksgxswapd` thread
 
-The driver doesn't perform any enclave cleanup (`sgx_encl_release()`).
-It is the responsibility of the host application to notice the invalidated enclave, destroy it and create a new one.
+The driver doesn't perform any enclave cleanup.
+It is the responsibility of the host application to notice the invalidated enclave, destroy it, and create a new one.
 Note that invalidated enclaves still consume memory: their EPC pages are not removed, though at some point they are swapped-out and do not consume EPC space.
 
 

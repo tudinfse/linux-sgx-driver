@@ -22,34 +22,32 @@ It waits in an endless loop and periodically swaps out unused EPC pages; see det
 The driver conveniently reuses the `shmem` (shared memory virtual file system) functionality.
 It allows to move pages between regular main memory and EPC regions.
 There are three main uses:
-1. Moving backing pages inside EPC with `EADD`
-2. Evicting EPC pages' content into backing memory with `EWB` / loading-back EPC page from regular memory with `ELDU`
-3. Evicting EPC pages' metadata into backing memory with `EWB` / loading-back this metadata from regular memory with `ELDU`
+1. Adding user-supplied pages to an enclave and thus to EPC with `EADD`
+2. Evicting EPC pages' content to regular memory with `EWB` / loading-back EPC page with `ELDU`
+3. Evicting EPC pages' metadata to regular memory with `EWB` / loading-back this metadata with `ELDU`
 
-To this end, at enclave creation (`sgx_ioc_enclave_create`), `shmem_file_setup()` creates two anonymous regular-memory regions (represented as `struct file`):
+To this end, at enclave creation `sgx_ioc_enclave_create()`, `shmem_file_setup()` creates two anonymous regular-memory regions (represented as `struct file`):
 * `backing` for EPC pages' content
 * `pcmd` for EPC pages' metadata (PCMD)
 
-As for sizes of these memory regions, `backing` has the same size as enclave size (`secs.size`) and `pcmd` has `secs.size / 32` since one 4B page keeps 32 128B PCMD entries. (This is slightly simplified; in reality, there is an additional backing page/pcmd entry for evicting SECS.)
+As for sizes of these memory regions, `backing` has the same size as enclave size (`secs.size`) and `pcmd` has `secs.size / 32` since one 4KB page keeps 32 128B PCMD entries. (This is slightly simplified; in reality, there is an additional backing page/pcmd entry for evicting SECS.)
 
 The driver encapsulates accesses to these backing shmem regions in `sgx_get_backing()`.
 This function can return a physical backing page for both `backing` and `pcmd` regions via a call to `shmem_read_mapping_page_gfp()`.
 Whenever an enclave needs to add, evict, or load-back a page, it simply calls `sgx_get_backing()` to find the enclave page's content/PCMD in backing regular memory.
 
 The real convenience of using `shmem` is that the driver does not care about swapping regular-memory pages to slower storage -- this is transparently done by the kernel.
-E.g., if an EPC page was swapped to hard disk, the `shmem` module will first load it into regular main memory and then allow access to it.
+E.g., if an EPC page was swapped to hard disk, the `shmem` module will first load it into regular main memory and then allow `ELDU` access to it.
 
-To clean-up and remove the shared-memory regions, the driver uses `fput()`: `fput(backing)` and `fput(pcmd)`.
+To clean-up and remove shared-memory regions, the driver uses `fput(backing)` and `fput(pcmd)`.
 
 
 ## EWB Page Eviction
 
-For page eviction, `EWB` requires three inputs:
+For page eviction, `EWB` requires three main inputs:
 1. EPC page virtual address -- enclave page to be evicted
 2. Pointer to PAGEINFO struct (four 8B fields, 32B total) with the following fields:
     - `srcpge` containing the physical address of a backing regular-memory page -> encrypted EPC page will be evicted here
-    - `linaddr` set to zero; note that EPC page address was given in (1), so this field can be zero
-    - `secs` set to zero
     - `pcmd` containing physical address of a corresponding regular-memory page storing PCMD metadata for this EPC page
 
 ## Background kernel thread ksgxswapd
@@ -66,7 +64,7 @@ To identify the set of pages to-evict, `ksgxswapd` does the following:
 3. Find (isolate) a set of pages in this enclave which were least recently used
 
 Note that this strategy uses a simple LRU policy at each step.
-For steps 1 and 2, the TGID contexts and enclaves are simply moved to the tail, i.e., there is a simple round-robin policy.
+For steps 1 and 2, the TGID contexts and enclaves are simply moved to the tail of the list, i.e., there is a simple round-robin policy.
 For step 3, all enclave pages benefit from the PTE's Access (A) bit automatically updated by hardware, and thus implement a true LRU policy.
 
 ## Paging Crypto MetaData (PCMD)
@@ -81,11 +79,11 @@ For step 3, all enclave pages benefit from the PTE's Access (A) bit automaticall
 PCMD contains three used and one reserved fields (128B total):
 1. `secinfo` is embedded inside PCMD and contains RWX, page-type, etc. flags
 2. `enclaveid` is 8B ID of corresponding enclave
-3. `mac` is 16B MAC covering (epc-page-contents, secinfo, enclaveid)
+3. `mac` is 16B MAC covering epc-page-contents + secinfo + enclaveid
 
-`EWB` fills PCMD and stores these 128 bytes unencrypted in a `pcmd` backing page. So, `pcmd` is an output for `EWB`.
+`EWB` fills PCMD and stores these 128 bytes unencrypted in a `pcmd` backing page.
 
-`ELDU` loads unencrypted PCMD from the backing pcmd page, checks MAC, and if it is correct, updates EPCM metadata with `PCMD.secinfo`. So, `pcmd` is an input for `ELDU`.
+`ELDU` loads unencrypted PCMD from the `pcmd` backing page, checks MAC, and if it is correct, updates EPCM metadata with `PCMD.secinfo`.
 
 ## Version Arrays (VA) during Eviction
 

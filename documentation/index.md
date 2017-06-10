@@ -19,30 +19,31 @@ This documentation is *unofficial* and written by Dmitrii Kuvaiskii mostly *for 
 
 ![sgx-driver-memory](figs/sgx-driver-memory.png "SGX Memory Layout")
 
-Intel SGX introduces an opaque region of memory *Processor Reserved Memory (PRM)*: all data stored in this region is confidentiality- and integrity protected.
+Intel SGX introduces an opaque region of memory *Processor Reserved Memory (PRM)*: all data stored in this region is confidentiality- and integrity-protected.
 Thus, instead of one contigious RAM address space, an SGX-enabled machine sees two separate regions: protected *PRM* and unprotected *regular main memory*.
-Since PRM is a limited resource -- with current Intel Skylake/Kaby Lake CPUs having ~100MB of PRM -- Intel SGX allows to evict (swap-out) and load-back enclave pages to/from regular memory.
+Since PRM is a limited resource -- approx. 100MB on current Intel Skylake/Kaby Lake CPUs -- Intel SGX allows to evict (swap-out) and load-back enclave pages to/from regular memory.
 
 Typically, the host application creates several enclaves (two in the diagram, each is `sgx_encl` object) in its virtual address space.
 Each enclave has its own dedicated range of virtual addresses *ELRANGE* where it stores its *enclave pages*.
 Note that ELRANGEs cannot overlap with other enclaves' ELRANGEs or with unprotected app's memory.
 
-Enclave pages residing in ELRANGE can be of three types: regular (REG), Thread-Control Structure (TCS), and SGX Enclave Control Structure (SECS).
-REG pages contain normal code & data, TCS pages -- metadata to govern enclave threads, SECS -- metadata to identify & check the whole enclave.
+Enclave pages residing in ELRANGE can be of two types: *regular* (REG) and *Thread-Control Structure* (TCS).
+REG pages contain normal code and data while TCS pages contain metadata to govern enclave threads.
 All enclave pages are maintained as `sgx_encl_page` objects in kernel space.
 
-Each enclave has exactly one SECS page.
-It is not accessible even from within the enclave, so the SGX driver assigns an out-of-range address to it -- directly after the end of ELRANGE.
-
-PRM can be constituted from a number of EPC banks (`sgx_epc_bank`).
-Each EPC bank is a separate device and has its own range of physical device addresses.
-Thus, a single enclave's pages can be scattered (in no particular order) among several EPC banks, and pages from several enclaves can end up in one EPC bank.
-The physical pages in EPC banks are `sgx_epc_page` objects in the driver terms.
+Each enclave has exactly one *SGX Enclave Control Structure* (SECS) page with metadata to identify and check the whole enclave.
+It is not accessible even from within the enclave, so the SGX driver assigns an out-of-range address to it -- directly after ELRANGE.
+The SECS page is also represented as `sgx_encl_page`.
 
 Intel SGX introduces another special type of EPC pages: *Version Array* (VA) pages.
 Each VA page contains 512 VA slots; each slot is associated with one REG/TCS/SECS page and keeps a random nonce to protect against replay attacks on page eviction/load-back.
 Note that VA pages are not present in ELRANGE, i.e., they cannot be accessed even by the enclave.
-The driver creates VA pages lazy on-demand (`sgx_va_page`) and *does not* swap them out (**yes, it should be implemented at some point**).
+The driver creates VA pages lazy on-demand (`sgx_va_page`) and *does not* swap them out ([**yes, it should be implemented at some point**](https://github.com/tudinfse/linux-sgx-driver/blob/master/documentation/paging.md#version-arrays-va-during-eviction)).
+
+Each EPC bank is a separate device and has its own range of physical device addresses.
+PRM can be constituted from a number of EPC banks (`sgx_epc_bank`).
+Thus, a single enclave's pages can be scattered (in no particular order) among several EPC banks, and pages from several enclaves can end up in one EPC bank.
+The physical pages in EPC banks are `sgx_epc_page` objects.
 
 Finally, since PRM can hold only a limited number of EPC pages at any time, Intel SGX introduces paging mechanisms to swap out unused pages.
 For this, the SGX driver allocates two memory regions per each enclave in regular memory: `backing` and `pcmd`.
@@ -55,13 +56,13 @@ The `pcmd` region contains Paging Crypto MetaData (PCMD) 128B-sized entries for 
 ![sgx-driver-structs](figs/sgx-driver-structs.png "SGX Driver Main Structures")
 
 The SGX driver must serve multiple enclaves in multiple processes simultaneously.
-Note that in SGX driver terminology, a *process* (or *host app* as I call it) is identified through its *TGID context*.
-Recall that each process (host app) has its own `pid` (or `tgid` in kernel terms); the driver queries `tgid` of the current process using `current` global variable.
+Note that in SGX driver terminology, a *process* (or *host app*) is identified through its *TGID context*.
+Recall that each process has its own `pid` (or `tgid` in kernel terms); the driver queries `tgid` of the current process using `current` global variable.
 Thus, each TGID context is associated with one host app.
 TGID contexts are needed for two main reasons: (1) swaping out EPC pages from a particular enclave of a particular TGID context and (2) suspending all enclaves in all host apps on hibernation.
 
 The SGX driver maintains a hierarchy of objects:
-1. A list of TGID contexts pointed to by `sgx_tgid_ctx_list` and with items of type `sgx_tgid_ctx`
+1. A global list of TGID contexts pointed to by `sgx_tgid_ctx_list` and with items of type `sgx_tgid_ctx`
 2. For each TGID context, a list of its enclaves pointed to by `sgx_tgid_ctx.encl_list` and with items of type `sgx_encl`
 3. For each enclave, several containers of enclave pages:
     - a list of VA pages pointed to by `sgx_encl.va_pages` and with items of type `sgx_va_page`

@@ -114,7 +114,7 @@ Documentation:
 
 ## Why is already encrypted EPC page re-encrypted during eviction?
 
-Because transparent MEE encryption is an implementation detail (due to PRM residing in RAM and not on CPU chip), and encryption during page eviction (`EWB`) is an architectural choice: https://software.intel.com/en-us/forums/intel-software-guard-extensions-intel-sgx/topic/722444
+Because transparent MEE encryption is an implementation detail (due to PRM residing in RAM and not on CPU chip), and encryption during page eviction (`EWB`) is an architectural choice: <https://software.intel.com/en-us/forums/intel-software-guard-extensions-intel-sgx/topic/722444>. In other words, if PRM is moved inside the CPU chip in the future, there will be no encryption overhead when data leaves CPU caches -- content will be encrypted only once on `EWB` page eviction.
 
 ## Why SGX needs ELDB (reload with BLOCKED state) when there is ELBU (reload with UNBLOCKED)?
 

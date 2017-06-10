@@ -13,24 +13,20 @@ There are only three commands:
 1. *Enclave creation*: host app requests to create new enclave using `ECREATE`
 2. *Enclave page addition*: host app requests to add & measure a new page to the created enclave, proceeding in two steps:
     - first the new page is added using `EADD`
-    - then a subset of the 16 256B-chunks (specified in `sgx_enclave_add_page.mrmask`) is measured using `EEXTEND`
+    - then a subset of 16 256B-chunks (specified in `sgx_enclave_add_page.mrmask`) is measured using `EEXTEND`
 3. *Enclave initialization*: host app requests to initialize new enclave using `EINIT`
 
 Note that all other enclave operations are performed in user space (`EENTER`, `ERESUME`, `EEXIT`, `EGETKEY`, `EREPORT`) or using paging/swapping mechanisms (`EBLOCK`, `ETRACK`, `ELDU`, `EWB`).
 
 ## IOCTL Code
 
-The driver registers `unlocked_ioctl` and `compat_ioctl` callbacks for the `ioctl()` syscall; both callbacks forward the command to the `sgx_ioctl()` function:
-```
-long sgx_ioctl(struct file *filep, unsigned int cmd, unsigned long arg);
-```
+The driver registers `unlocked_ioctl` and `compat_ioctl` callbacks for the `ioctl()` syscall; both callbacks forward the command to the `sgx_ioctl()` function.
+This wrapper function calls a corresponding SGX driver function based on the IOCTL number:
+1. `SGX_IOC_ENCLAVE_CREATE`: call `sgx_ioc_enclave_create()` with argument `struct sgx_enclave_create`
+2. `SGX_IOC_ENCLAVE_ADD_PAGE`: call `sgx_ioc_enclave_add_page()` with argument `struct sgx_enclave_add_page`
+3. `SGX_IOC_ENCLAVE_INIT`: call `sgx_ioc_enclave_init()` with argument `struct sgx_enclave_init`
 
-As described above, there are three commands, each with its own IOCTL number:
-1. `SGX_IOC_ENCLAVE_CREATE`: calls `sgx_ioc_enclave_create()` with argument `struct sgx_enclave_create`
-2. `SGX_IOC_ENCLAVE_ADD_PAGE`: calls `sgx_ioc_enclave_add_page()` with argument `struct sgx_enclave_add_page`
-3. `SGX_IOC_ENCLAVE_INIT`: calls `sgx_ioc_enclave_init()` with argument `struct sgx_enclave_init`
-
-Note that all three commands receive one struct argument from the host app and read no data from the driver (so, all IOCTL numbers are defined with `_IOW`).
+Note that all three commands receive one struct argument from the host app and provide no output for host app (so, all IOCTL numbers are defined with `_IOW`).
 
 ### sgx_ioc_enclave_create
 
@@ -66,9 +62,7 @@ The function initializes the enclave as follows:
 
 1. Copies the user-supplied SIGSTRUCT and EINITTOKEN structures into kernel space
 2. Flushes pending enclave pages `EADD`ed by the worker thread in background (see above)
-3. Calls `EINIT`, retries several times on failure:
-    - `EINIT` might fail because of an interrupt storm
-    - so first try to spin several times, then try to sleep a bit several times
+3. Calls `EINIT`, retries several times on failure, first with spinning, then with sleeping (`EINIT` might fail because of an interrupt storm)
 4. On success, marks the enclave as initialized
 
 Note that after this step, SGX 1.0 disallows adding/measuring new pages.
