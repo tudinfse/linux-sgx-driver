@@ -28,6 +28,12 @@ This allows for a quick exit from add-page, swapping, etc. routines.
 The enclave's resources, however, are actually released (all enclave pages removed from the kernel space and EPC) when the enclave's VMA closes (`sgx_vma_close`).
 **TODO:** Still unclear why this is needed if the enclave is released only later.
 
+Note that `sgx_dev` also registers a callback to `get_unmapped_area()`.
+This callback is invoked during `mmap()` to allocate ELRANGE for a new enclave.
+ELRANGE base address must be a power-of-two but the Linux kernel assigns some arbitrary address by default.
+To prevent this, the `sgx_get_unmapped_area()` actually finds a sufficiently large unmapped area, aligns the address to be power-of-two, and returns it to the kernel.
+This way, the allocated memory region is guaranteed to start at a power-of-two base address.
+
 
 ## PRM and EPC Banks
 
@@ -79,11 +85,12 @@ Note that invalidated enclaves still consume memory: their EPC pages are not rem
 
 # Bugs/issues
 
-* **TODO**: Still not sure why `sgx_get_unmapped_area()` is needed.
-
 * `sgx_drv_probe()` and `sgx_init_platform()` both perform the same CPUID validation steps. One of these functions thus seems redundant.
+    - **known issue**
 
-* There is probably a bug in `sgx_dev_init()`:
+* There is a bug in `sgx_dev_init()`:
     - `sgx_page_cache_init()` is called as many times as there are EPC banks
     - but `sgx_page_cache_init()` creates a background thread `ksgxswapd_tsk = kthread_run(ksgxswapd, NULL, "ksgxswapd")` each time it is called
     - thus, there will be several background threads created if there are several EPC banks; only the last one will be known to the driver via global variable `ksgxswapd_tsk`
+    - **known issue**
+

@@ -9,8 +9,8 @@ Linux documentation on paging:
 ![sgx-driver-paging](figs/sgx-driver-paging.png "Memory Operations in SGX and Paging")
 
 Memory operations in SGX include:
-* `open` -- when a process (host app) forks, the driver invokes `sgx_vma_open()` (**TODO: what does it do?**)
-* `close` -- when a process (host app) terminates, the driver invokes `sgx_vma_close()` to release the enclave
+* `open` -- when a process (host app) forks, the driver invokes `sgx_vma_open()` to bump the number of processes that use this enclave
+* `close` -- when a process (host app) terminates, the driver invokes `sgx_vma_close()` to decrease the number of processes that use this enclave, and if there are no processes left, to release the enclave
 * `fault` -- when a page fault occurs, the driver invokes its custom page fault handler `sgx_vma_fault()` to load-back the evicted EPC page
 * `access` -- when ptrace/gdb issues a debug memory access, the driver invokes `sgx_vma_access()` to perform `EDBGRD` or `EDBGWR`
 

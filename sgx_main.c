@@ -119,13 +119,14 @@ static int sgx_mmap(struct file *file, struct vm_area_struct *vma)
 	return 0;
 }
 
-/* handler for get_unmapped_area ??? */
+/* handler for get_unmapped_area: finds correct addr to start ELRANGE */
 static unsigned long sgx_get_unmapped_area(struct file *file,
 					   unsigned long addr,
 					   unsigned long len,
 					   unsigned long pgoff,
 					   unsigned long flags)
 {
+	/* enclave size must be at least 2 pages and a power-of-two */
 	if (len < 2 * PAGE_SIZE || (len & (len - 1)))
 		return -EINVAL;
 
@@ -146,13 +147,17 @@ static unsigned long sgx_get_unmapped_area(struct file *file,
 		return -EINVAL;
 #endif
 
+	/* find base address of unmapped area twice bigger as requested
+	   (twice biffer because we must also align address on power-of-two) */
 	addr = current->mm->get_unmapped_area(file, addr, 2 * len, pgoff,
 					      flags);
 	if (IS_ERR_VALUE(addr))
 		return addr;
 
+	/* align base address to power-of-two; guaranteed to have unmapped area */
 	addr = (addr + (len - 1)) & ~(len - 1);
 
+	/* aligned addr will be ELRANGE base address */
 	return addr;
 }
 
@@ -308,7 +313,8 @@ static int sgx_dev_init(struct device *dev)
 			goto out_iounmap;
 		}
 #endif
-		/* sgx_page_cache_init() calls kthread_run() -- doesn't it create many background threads ??? */
+		/* BUG: sgx_page_cache_init() calls kthread_run() and thus creates
+		 *      many background threads ??? */
 		ret = sgx_page_cache_init(sgx_epc_banks[i].start,
 			sgx_epc_banks[i].end - sgx_epc_banks[i].start);
 		if (ret) {

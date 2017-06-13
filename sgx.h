@@ -112,7 +112,7 @@ static inline void sgx_free_va_slot(struct sgx_va_page *page,
 /* Metadata flags for enclave pages: is it TCS page? is it reserved? */
 enum sgx_encl_page_flags {
 	SGX_ENCL_PAGE_TCS	= BIT(0),
-	SGX_ENCL_PAGE_RESERVED	= BIT(1),  /* used for debug, what exactly it does ??? */
+	SGX_ENCL_PAGE_RESERVED	= BIT(1),  /* used for debug */
 };
 
 /**

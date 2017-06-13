@@ -96,6 +96,7 @@ static void sgx_vma_close(struct vm_area_struct *vma)
 	zap_vma_ptes(vma, vma->vm_start, vma->vm_end - vma->vm_start);
 	encl->flags |= SGX_ENCL_DEAD;
 	mutex_unlock(&encl->lock);
+	/* actually release enclave if not used by any process */
 	kref_put(&encl->refcount, sgx_encl_release);
 }
 
