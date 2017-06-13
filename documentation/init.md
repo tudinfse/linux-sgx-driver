@@ -94,3 +94,16 @@ Note that invalidated enclaves still consume memory: their EPC pages are not rem
     - thus, there will be several background threads created if there are several EPC banks; only the last one will be known to the driver via global variable `ksgxswapd_tsk`
     - **known issue**
 
+* There is a bug in `sgx_drv_probe()`:
+    - according to Table 1-4 in Section 1.7.2 of the "Intel Software Guard Extensions Programming Reference": maximum enclave size is `2^(EDX[7:0])` bytes when not in 64-bit mode and `2^(EDX[15:8])` bytes when operating in 64-bit mode
+    - however, in actual code, `sgx_encl_size_max_64` and `sgx_encl_size_max_32` are updated incorrectly (swapped)
+    - our experiments indicate it is indeed a bug in the driver (kudos to Sergei Arnautov)
+
+```
+	if (edx & 0xFFFF) {
+#ifdef CONFIG_X86_64
+		sgx_encl_size_max_64 = 2ULL << (edx & 0xFF);         // must be as below
+#endif
+		sgx_encl_size_max_32 = 2ULL << ((edx >> 8) & 0xFF);  // must be as above
+	}
+```
